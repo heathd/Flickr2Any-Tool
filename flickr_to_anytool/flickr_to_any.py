@@ -147,6 +147,7 @@ def setup_directory_widgets(preprocessing, main_settings):
     metadata_dir = main_settings.add_argument(
         '--metadata-dir',
         metavar='Metadata Directory',
+        required=True,
         help='Directory for metadata files'
     )
 
@@ -154,6 +155,7 @@ def setup_directory_widgets(preprocessing, main_settings):
     photos_dir = main_settings.add_argument(
         '--photos-dir',
         metavar='Photos Directory',
+        required=True,
         help='Directory for photos'
     )
 
@@ -161,6 +163,7 @@ def setup_directory_widgets(preprocessing, main_settings):
     output_dir = main_settings.add_argument(
         '--output-dir',
         metavar='Output Directory',
+        required=True,
         help='Directory for output files'
     )
 
