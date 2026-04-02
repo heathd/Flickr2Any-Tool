@@ -12,7 +12,7 @@ authors = [{ name = "Rob Brown", email = "your.email@example.com" }]
 dependencies = ["flickrapi", "Pillow", "tqdm", "tomlkit"]
 
 [project.scripts]
-flickr-to-any = "flickr_to_anytool.flickr_to_any:gui_main"
+flickr-to-any = "flickr_to_anytool.flickr_to_any:main"
 
 [project.urls]
 Homepage = "https://github.com/brownphotographic/Flickr2Any-Tool"
