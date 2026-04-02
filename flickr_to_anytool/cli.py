@@ -256,6 +256,13 @@ def main():
         help='Number of photos to process in each batch (lower = less memory use but slower). Min 100, Max 5000'
     )
 
+    advanced.add_argument(
+        '--debug',
+        action='store_true',
+        default=False,
+        help='Enable debug logging for troubleshooting'
+    )
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -296,9 +303,12 @@ def main():
     logging.root.addHandler(console_handler)
 
     # Set log level
-    logging.root.setLevel(logging.INFO)
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.root.setLevel(log_level)
 
     logging.info("Logging initialized")
+    if args.debug:
+        logging.debug("Debug logging enabled")
 
     try:
         # Handle preprocessing first
