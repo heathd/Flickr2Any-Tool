@@ -932,6 +932,7 @@ class FlickrToImmich:
                     output_dir: str,
                     date_format: str = 'yyyy/yyyy-mm-dd',
                     api_key: Optional[str] = None,
+                    api_secret: Optional[str] = None,
                     log_file: Optional[str] = None,
                     results_dir: Optional[str] = None,
                     include_extended_description: bool = INCLUDE_EXTENDED_DESCRIPTION,
@@ -1069,14 +1070,21 @@ class FlickrToImmich:
             # Initialize Flickr API if key is provided
             self.flickr = None
             self.user_info_cache = {}
-            if api_key:
+            if api_key and api_secret:
                 try:
-                    self.flickr = flickrapi.FlickrAPI(api_key, '', format='etree')
+                    self.flickr = flickrapi.FlickrAPI(api_key, api_secret, format='etree')
                     logging.getLogger('flickrapi').setLevel(logging.ERROR)
-                    logging.info("Successfully initialized Flickr API")
+                    if not self.flickr.token_valid(perms='read'):
+                        self.flickr.get_request_token(oauth_callback='oob')
+                        authorize_url = self.flickr.auth_url(perms='read')
+                        print(f"\nAuthorise this app by opening the following URL in your browser:\n{authorize_url}\n")
+                        verifier = input("Enter the verifier code from Flickr: ").strip()
+                        self.flickr.get_access_token(verifier)
+                    logging.info("Successfully authenticated with Flickr API")
                 except Exception as e:
-                    logging.warning(f"Failed to initialize Flickr API: {e}")
+                    logging.warning(f"Failed to authenticate with Flickr API: {e}")
                     logging.warning("Comments and favorites lookup will be limited")
+                    self.flickr = None
             try:
                 # Debug: List ALL files in metadata directory
                 logging.info("=== DIRECTORY CONTENTS ===")
@@ -3119,6 +3127,12 @@ def main():
         help='Enter your Flickr API key',
         default=''
     )
+    advanced.add_argument(
+        '--api-secret',
+        metavar='Flickr API Secret',
+        help='Enter your Flickr API secret',
+        default=''
+    )
 
     advanced.add_argument(
         '--cpu-cores',
@@ -3199,17 +3213,17 @@ def main():
             )
             preprocessor.process_exports()
 
-        # Handle API key
+        # Handle API key and secret
         if args.use_api:
-            if args.api_key:
-                api_key = args.api_key
-                os.environ['FLICKR_API_KEY'] = args.api_key
-            else:
-                api_key = os.environ.get('FLICKR_API_KEY')
-            if not api_key:
-                logging.warning("Flickr API enabled but no API key provided in GUI or environment")
+            api_key = args.api_key or os.environ.get('FLICKR_API_KEY')
+            api_secret = args.api_secret or os.environ.get('FLICKR_API_SECRET')
+            if not api_key or not api_secret:
+                logging.warning("Flickr API enabled but API key and/or secret not provided")
+                api_key = None
+                api_secret = None
         else:
             api_key = None
+            api_secret = None
 
         # Create converter instance
         converter = FlickrToImmich(
@@ -3218,6 +3232,7 @@ def main():
             output_dir=args.output_dir,
             date_format=args.date_format,
             api_key=api_key,
+            api_secret=api_secret,
             log_file=str(log_file),
             results_dir=args.results_dir,
             include_extended_description=not args.no_extended_description,
