@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import gc
 import re
+import psutil
 
 from .constants import MediaType, EXIF_ORIENTATION_MAP, INCLUDE_EXTENDED_DESCRIPTION, WRITE_XMP_SIDECARS, log_memory_usage
 from .jpeg_verifier import JPEGVerifier
