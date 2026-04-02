@@ -1,1 +1,1 @@
-from flickr_to_anytool.flickr_to_any import gui_main
+from flickr_to_anytool.flickr_to_any import main
