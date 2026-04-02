@@ -35,7 +35,6 @@ import mimetypes
 from tqdm import tqdm
 import os
 import io
-import wx
 import flickrapi
 import xml.etree.ElementTree as ET
 from importlib import metadata
@@ -45,7 +44,6 @@ import concurrent.futures
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import ExifTags
-from gooey import Gooey, GooeyParser
 import argparse
 import sys
 import traceback
@@ -73,8 +71,6 @@ def log_memory_usage():
     memory = process.memory_info()
     logging.info(f"Memory usage: {memory.rss / (1024 * 1024):.1f} MB")
 
-def is_cli_mode():
-    return '--cli' in sys.argv
 
 class MediaType(Enum):
     """Supported media types"""
@@ -144,45 +140,35 @@ def setup_directory_widgets(preprocessing, main_settings):
     source_dir = preprocessing.add_argument(
         '--source-dir',
         metavar='Source Directory',
-        widget='DirChooser',
-        help='Directory for Flickr zip files',
-        gooey_options={'full_width': True}
+        help='Directory for Flickr zip files'
     )
 
     # Add metadata directory widget
     metadata_dir = main_settings.add_argument(
         '--metadata-dir',
         metavar='Metadata Directory',
-        widget='DirChooser',
-        help='Directory for metadata files',
-        gooey_options={'full_width': True}
+        help='Directory for metadata files'
     )
 
     # Add photos directory widget
     photos_dir = main_settings.add_argument(
         '--photos-dir',
         metavar='Photos Directory',
-        widget='DirChooser',
-        help='Directory for photos',
-        gooey_options={'full_width': True}
+        help='Directory for photos'
     )
 
     # Add output directory widget
     output_dir = main_settings.add_argument(
         '--output-dir',
         metavar='Output Directory',
-        widget='DirChooser',
-        help='Directory for output files',
-        gooey_options={'full_width': True}
+        help='Directory for output files'
     )
 
     # Add results directory widget
     results_dir = main_settings.add_argument(
         '--results-dir',
         metavar='Results Directory',
-        widget='DirChooser',
-        help='Directory for results files',
-        gooey_options={'full_width': True}
+        help='Directory for results files'
     )
 
     return preprocessing, main_settings
@@ -2961,67 +2947,14 @@ class FlickrToImmich:
             # Restore original handlers
             logging.getLogger().handlers = original_handlers
 
-def gui_main():
-    """Entry point for GUI version"""
-    try:
-        if '--cli' in sys.argv:
-            logging.info("Running in CLI mode")
-            sys.argv.remove('--cli')
-            # Call the main function directly without Gooey/wx
-            main()
-            return
-
-        # Create wx.App instance before using wx
-        app = wx.App(False)
-
-        # Run with Gooey
-        Gooey(
-            program_name="Flickr to Any Tool",
-            default_size=(1000, 800),
-            minimum_size=(800, 600),
-            resizable=True,
-            navigation='TABBED',
-            sidebar_title='Steps',
-            terminal_font_family='Courier New',
-            terminal_font_size=8,
-            show_restart_button=False,
-            tabbed_groups=True,
-            progress_regex=r"(\d+)%",
-            progress_expr="min(100, int(float({\1})))",
-            hide_progress_msg=False,
-            console_height=200,
-            show_failure_modal=True,
-            group_by_type=True,
-            scrollable=True,
-            fullscreen=False,
-            header_height=80,
-            header_show_title=True,
-            header_bg_color='#3c3f41',
-            terminal_panel_color='#F0F0F0',
-            show_success_modal=False
-        )(main)()
-
-    except Exception as e:
-        error_msg = f"Error in gui_main: {str(e)}\n"
-        error_msg += "Traceback:\n"
-        import traceback
-        error_msg += traceback.format_exc()
-        print(error_msg)
-        logging.error(error_msg)
-        raise
 
 def main():
-    import sys
-    import argparse
-    from gooey import GooeyParser
-
-    parser = GooeyParser(description='Flickr to Any Tool')
+    parser = argparse.ArgumentParser(description='Flickr to Any Tool')
 
     # Create groups
     preprocessing = parser.add_argument_group(
         'Step 1: Preprocessing',
-        'Extract Flickr export zip files',
-        gooey_options={'show_border': True}
+        'Extract Flickr export zip files'
     )
 
     # Add other non-directory arguments to preprocessing
@@ -3030,14 +2963,12 @@ def main():
         metavar='Enable ZIP Preprocessing',
         action='store_true',
         help='Enable if you need to extract Flickr export zip files first',
-        default=True,
-        gooey_options={'checkbox_label': 'Process ZIP files'}
+        default=True
     )
 
     main_settings = parser.add_argument_group(
         'Step 2: Main Settings',
-        'Configure main conversion options',
-        gooey_options={'show_border': True}
+        'Configure main conversion options'
     )
     # Setup directory widgets
     preprocessing, main_settings = setup_directory_widgets(preprocessing, main_settings)
@@ -3045,8 +2976,7 @@ def main():
     # Create export type group
     export_type = parser.add_argument_group(
         'Step 3: Export Type',
-        'Choose what to export',
-        gooey_options={'show_border': True}
+        'Choose what to export'
     )
 
     # Main settings non-directory arguments
@@ -3074,10 +3004,7 @@ def main():
             'Highlights only'
         ],
         default='Full library and Highlights',
-        help='Choose what to export from your Flickr library',
-        gooey_options={
-            'label': 'Export Mode'
-        }
+        help='Choose what to export from your Flickr library'
     )
 
     # Interesting photos configuration
@@ -3102,10 +3029,7 @@ def main():
         metavar='Favorite Weight',
         type=float,
         default=2,
-        help='Weight multiplier for favorites (default: 10.0)',
-        gooey_options={
-            'label': 'Favorite Weight'
-        }
+        help='Weight multiplier for favorites (default: 10.0)'
     )
 
     export_type.add_argument(
@@ -3113,10 +3037,7 @@ def main():
         metavar='Comment Weight',
         type=float,
         default=1,
-        help='Weight multiplier for comments (default: 5.0)',
-        gooey_options={
-            'label': 'Comment Weight'
-        }
+        help='Weight multiplier for comments (default: 5.0)'
     )
 
     export_type.add_argument(
@@ -3124,10 +3045,7 @@ def main():
         metavar='View Weight',
         type=float,
         default=2,
-        help='Weight multiplier for views (default: 0.1)',
-        gooey_options={
-            'label': 'View Weight'
-        }
+        help='Weight multiplier for views (default: 0.1)'
     )
 
     # Add minimum threshold settings
@@ -3136,10 +3054,7 @@ def main():
         metavar='Minimum Views',
         type=int,
         default=20,
-        help='Minimum views required (default: 20)',
-        gooey_options={
-            'label': 'Minimum Views'
-        }
+        help='Minimum views required (default: 20)'
     )
 
     export_type.add_argument(
@@ -3147,10 +3062,7 @@ def main():
         metavar='Minimum Favorites',
         type=int,
         default=1,
-        help='Minimum favorites required (default: 0)',
-        gooey_options={
-            'label': 'Minimum Favorites'
-        }
+        help='Minimum favorites required (default: 0)'
     )
 
     export_type.add_argument(
@@ -3158,75 +3070,58 @@ def main():
         metavar='Minimum Comments',
         type=int,
         default=1,
-        help='Minimum comments required (default: 0)',
-        gooey_options={
-            'label': 'Minimum Comments'
-        }
+        help='Minimum comments required (default: 0)'
     )
 
     # Advanced options
     advanced = parser.add_argument_group(
         'Step 4: Advanced Options',
-        'Configure additional settings',
-        gooey_options={'show_border': True}
+        'Configure additional settings'
     )
 
     advanced.add_argument(
         '--no-extended-description',
         metavar='Skip Extended Description',
         action='store_true',
-        help='Only include original description',
-        gooey_options={'checkbox_label': 'Skip extended description'}
+        help='Only include original description'
     )
     advanced.add_argument(
         '--no-xmp-sidecars',
         metavar='Skip XMP Files',
         action='store_true',
-        help='Skip writing XMP sidecar files',
-        gooey_options={'checkbox_label': 'Skip XMP sidecar files'}
+        help='Skip writing XMP sidecar files'
     )
     advanced.add_argument(
         '--export-block-if-failure',
         metavar='Block on Failure',
         action='store_true',
-        help='Stop if metadata processing fails',
-        gooey_options={'checkbox_label': 'Stop on metadata failure'}
+        help='Stop if metadata processing fails'
     )
     advanced.add_argument(
         '--resume',
         metavar='Resume Previous',
         action='store_true',
-        help='Skip existing files',
-        gooey_options={'checkbox_label': 'Resume previous run'}
+        help='Skip existing files'
     )
     advanced.add_argument(
         '--quiet',
         metavar='Quiet Mode',
         action='store_true',
         default=True,
-        help='Reduce console output',
-        gooey_options={'checkbox_label': 'Quiet mode'}
+        help='Reduce console output'
     )
     advanced.add_argument(
         '--use-api',
         metavar='Use Flickr API for comments and favorites',
         action='store_true',
         default=False,
-        help='Use Flickr API for looking up comments and favorites',
-        gooey_options={
-            'checkbox_label': 'Use Flickr API'
-        }
+        help='Use Flickr API for looking up comments and favorites'
     )
     advanced.add_argument(
         '--api-key',
         metavar='Flickr API Key',
         help='Enter your Flickr API key',
-        default='',
-        gooey_options={
-            'visible_when': {
-                'use-api': True  # Only show when use-api is checked
-            }
-        }
+        default=''
     )
 
     advanced.add_argument(
@@ -3234,12 +3129,7 @@ def main():
         metavar='CPU Cores',
         type=int,
         default=min(os.cpu_count(), 4),  # Default to lesser of 4 or available cores
-        help=f'Number of CPU cores to use (default: {min(os.cpu_count(), 4)}, max: {os.cpu_count()})',
-        gooey_options={
-            'label': 'CPU Cores',
-            'min': 1,
-            'max': os.cpu_count()
-        }
+        help=f'Number of CPU cores to use (default: {min(os.cpu_count(), 4)}, max: {os.cpu_count()})'
     )
 
     advanced.add_argument(
@@ -3247,11 +3137,7 @@ def main():
         metavar='Max Memory %',
         type=int,
         default=75,
-        help='Maximum percentage of system memory to use',
-        gooey_options={
-            'min': 25,
-            'max': 90
-        }
+        help='Maximum percentage of system memory to use'
     )
 
     advanced.add_argument(
@@ -3259,11 +3145,7 @@ def main():
         metavar='Batch Size',
         type=int,
         default=2500,
-        help='Number of photos to process in each batch (lower = less memory use but slower). Min 100, Max 5000',
-        gooey_options={
-            'min': 100,
-            'max': 5000
-        }
+        help='Number of photos to process in each batch (lower = less memory use but slower). Min 100, Max 5000'
     )
 
     # Parse arguments
@@ -3402,14 +3284,4 @@ def main():
     return args
 
 if __name__ == '__main__':
-    print("Starting program...")
-    print(f"CLI mode: {is_cli_mode()}")
-    print(f"Arguments: {sys.argv}")
-
-    if is_cli_mode():
-        print("Entering CLI mode")
-        sys.argv.remove('--cli')  # Remove CLI flag
-        main()  # Run without Gooey
-    else:
-        print("Entering GUI mode")
-        gui_main()  # Use the new gui_main function
+    main()
