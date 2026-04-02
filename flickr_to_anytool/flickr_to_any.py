@@ -2960,7 +2960,6 @@ def main():
     # Add other non-directory arguments to preprocessing
     preprocessing.add_argument(
         '--zip-preprocessing',
-        metavar='Enable ZIP Preprocessing',
         action='store_true',
         help='Enable if you need to extract Flickr export zip files first',
         default=True
@@ -3081,38 +3080,32 @@ def main():
 
     advanced.add_argument(
         '--no-extended-description',
-        metavar='Skip Extended Description',
         action='store_true',
         help='Only include original description'
     )
     advanced.add_argument(
         '--no-xmp-sidecars',
-        metavar='Skip XMP Files',
         action='store_true',
         help='Skip writing XMP sidecar files'
     )
     advanced.add_argument(
         '--export-block-if-failure',
-        metavar='Block on Failure',
         action='store_true',
         help='Stop if metadata processing fails'
     )
     advanced.add_argument(
         '--resume',
-        metavar='Resume Previous',
         action='store_true',
         help='Skip existing files'
     )
     advanced.add_argument(
         '--quiet',
-        metavar='Quiet Mode',
         action='store_true',
         default=True,
         help='Reduce console output'
     )
     advanced.add_argument(
         '--use-api',
-        metavar='Use Flickr API for comments and favorites',
         action='store_true',
         default=False,
         help='Use Flickr API for looking up comments and favorites'
