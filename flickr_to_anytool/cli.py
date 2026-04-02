@@ -279,7 +279,7 @@ def main():
     if missing_dirs:
         error_msg = f"Please set the following directories: {', '.join(missing_dirs)}"
         logging.error(error_msg)
-        return args
+        return
 
     # Get the script's directory
     script_dir = Path(__file__).parent
@@ -399,6 +399,4 @@ def main():
         logging.error(f"Fatal error: {str(e)}")
         sys.stdout.flush()
         raise
-
-    return args
 
