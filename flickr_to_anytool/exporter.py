@@ -1534,7 +1534,7 @@ class FlickrToImmich:
                 batch_end = min(batch_start + self.batch_size, len(photo_items))
                 current_batch = photo_items[batch_start:batch_end]
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=self.cpu_cores) as executor:
+                with ThreadPoolExecutor(max_workers=self.cpu_cores) as executor:
                     futures = []
                     for photo_id, albums in current_batch:
                         if organization == 'by_date':
