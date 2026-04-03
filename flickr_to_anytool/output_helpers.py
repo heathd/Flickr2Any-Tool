@@ -31,19 +31,18 @@ class OutputHelpers:
 
     @staticmethod
     def get_destination_filename(photo_id: str, source_file: Path, photo_json: Optional[Dict]) -> str:
-        """Get the destination filename for a photo, without Flickr ID"""
+        """Get the destination filename for a photo, always including the photo ID"""
         try:
             # Get original name from metadata if available
             if photo_json and photo_json.get('name'):
                 original_name = photo_json['name'].strip()
                 # Ensure name isn't empty after stripping
                 if not original_name:
-                    original_name = source_file.name
+                    original_name = source_file.stem
             else:
-                # Use the original filename
-                original_name = source_file.name
+                # Use the original filename stem
+                original_name = source_file.stem
 
-            # Remove all Flickr IDs from filename
             # Split name and extension
             name_base, ext = os.path.splitext(original_name)
 
@@ -57,23 +56,18 @@ class OutputHelpers:
             while re.search(r'_\d{8,11}(?:_o)?', name_base):
                 name_base = re.sub(r'_\d{8,11}(?:_o)?', '', name_base)
 
-            # Reconstruct filename
-            dest_filename = f"{name_base}{ext}"
-
-            # Ensure extension is present
-            if not dest_filename.lower().endswith(source_file.suffix.lower()):
-                dest_filename = f"{dest_filename}{source_file.suffix}"
+            # Always include photo ID to ensure uniqueness
+            dest_filename = f"{name_base}_{photo_id}{source_file.suffix}"
 
             # Sanitize the filename
             return OutputHelpers.sanitize_filename(dest_filename)
 
         except Exception as e:
             logging.error(f"Error creating destination filename for {photo_id}: {str(e)}")
-            # Fallback to a safe filename without ID
+            # Fallback to source stem with photo ID
             name_base = source_file.stem
-            # Remove any Flickr IDs from the fallback name
             name_base = re.sub(r'_\d{8,11}(?:_o)?', '', name_base)
-            return f"{name_base}{source_file.suffix}"
+            return f"{name_base}_{photo_id}{source_file.suffix}"
 
     @staticmethod
     def sanitize_filename(filename: str) -> str:
