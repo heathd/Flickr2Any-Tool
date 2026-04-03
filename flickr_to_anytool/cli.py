@@ -71,7 +71,7 @@ def main():
         '--zip-preprocessing',
         action='store_true',
         help='Enable if you need to extract Flickr export zip files first',
-        default=True
+        default=False
     )
 
     main_settings = parser.add_argument_group(
@@ -325,6 +325,7 @@ def main():
         if args.use_api:
             api_key = args.api_key or os.environ.get('FLICKR_API_KEY')
             api_secret = args.api_secret or os.environ.get('FLICKR_API_SECRET')
+            logging.info("using Flickr API")
             if not api_key or not api_secret:
                 logging.warning("Flickr API enabled but API key and/or secret not provided")
                 api_key = None
@@ -349,6 +350,7 @@ def main():
             resume=args.resume,
             use_api=args.use_api,
             quiet=args.quiet,
+            debug=args.debug,
             fave_weight=args.fave_weight,
             comment_weight=args.comment_weight,
             view_weight=args.view_weight,

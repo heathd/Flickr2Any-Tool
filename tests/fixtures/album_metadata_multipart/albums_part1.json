@@ -1,0 +1,19 @@
+{
+	"albums": [
+		{
+			"photo_count": "2",
+			"id": "29495325938624887",
+			"url": "https://www.flickr.com/photos/janedoe/albums/29495325938624887",
+			"title": "Bob 40th",
+			"description": "Uploaded from mac",
+			"view_count": "0",
+			"created": "1759091923",
+			"last_updated": "1759091996",
+			"cover_photo": "https://www.flickr.com/photos/janedoe/0",
+			"photos": [
+				"56824916781",
+				"56824916782"
+			]
+		}
+	]
+}

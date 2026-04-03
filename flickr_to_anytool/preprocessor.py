@@ -2,11 +2,16 @@
 Flickr export preprocessor - extracts ZIP files into metadata and photos directories
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import os
 from pathlib import Path
 import shutil
+import sys
 import zipfile
 from typing import List, Dict
+
+from tqdm import tqdm
 
 SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.mp4', '.mov', '.avi', '.mkv'}
 

@@ -7,3 +7,5 @@ flickr_to_immich.log
 build/lib/flickr_to_anytool/flickr_to_any.py
 /build/lib/flickr_to_anytool
 build/lib/flickr_to_anytool/flickr_to_any.py
+/data
+.vscode

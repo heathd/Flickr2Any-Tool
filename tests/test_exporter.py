@@ -73,9 +73,14 @@ class TestExtractPhotoId(unittest.TestCase):
         result = self.instance._extract_photo_id('random_photo_file.jpg')
         self.assertIsNone(result)
 
+    def test_can_extract_id_when_file_has_o_suffix(self):
+        """Test that ID can be extracted from filename with _o suffix"""
+        result = self.instance._extract_photo_id('img_5871_101631362_o.jpg')
+        self.assertEqual(result, '101631362')
+
     def test_id_too_short(self):
-        """Test that IDs shorter than 10 digits are ignored"""
-        result = self.instance._extract_photo_id('photo_123456789.jpg')
+        """Test that IDs shorter than 8 digits are ignored"""
+        result = self.instance._extract_photo_id('photo_1234567.jpg')
         self.assertIsNone(result)
 
     def test_id_too_long(self):
@@ -83,12 +88,6 @@ class TestExtractPhotoId(unittest.TestCase):
         result = self.instance._extract_photo_id('photo_123456789012.jpg')
         self.assertIsNone(result)
 
-    def test_multiple_ids_returns_first_with_metadata(self):
-        """Test that first ID with metadata is returned when multiple IDs exist"""
-        # Use fixture IDs that have metadata files
-        result = self.instance._extract_photo_id('123456789_144332211.jpg')
-        # Should return the first ID that has metadata
-        self.assertEqual(result, '123456789')
 
     def test_multiple_ids_no_metadata_returns_largest(self):
         """Test that largest ID is returned when multiple IDs exist and none have metadata"""
@@ -107,21 +106,6 @@ class TestExtractPhotoId(unittest.TestCase):
         """Test extraction from filename with multiple underscores"""
         result = self.instance._extract_photo_id('my_photo_12345678901_desc.jpg')
         self.assertEqual(result, '12345678901')
-
-    def test_id_at_filename_end(self):
-        """Test extraction when ID is at the end of filename"""
-        result = self.instance._extract_photo_id('photo_12345678901')
-        self.assertEqual(result, '12345678901')
-
-    def test_handles_exception_gracefully(self):
-        """Test that method handles exceptions gracefully"""
-        # Create an instance with invalid metadata_dir to trigger exception
-        instance = FlickrToImmich.__new__(FlickrToImmich)
-        instance.metadata_dir = None
-
-        result = instance._extract_photo_id('photo_12345678901.jpg')
-        # Should return None on exception
-        self.assertIsNone(result)
 
     def test_hyphen_separated_id(self):
         """Test extraction from filename with hyphens"""

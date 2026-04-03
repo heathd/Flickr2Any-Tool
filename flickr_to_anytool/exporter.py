@@ -3,28 +3,26 @@ Flickr to Immich export handler - main conversion logic
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional
 import json
 import logging
 import shutil
-import subprocess
 import time
-import os
-import io
 import sys
-import flickrapi
-import xml.etree.ElementTree as ET
 from datetime import datetime
-from PIL import Image
-from PIL import ExifTags
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import gc
-import re
 import psutil
 
-from .constants import MediaType, EXIF_ORIENTATION_MAP, INCLUDE_EXTENDED_DESCRIPTION, WRITE_XMP_SIDECARS, log_memory_usage
-from .jpeg_verifier import JPEGVerifier
+from flickr_to_anytool.exif_writer import ExifWriter
+from flickr_to_anytool.flickr_api_metadata import FlickrApiMetadata
+from flickr_to_anytool.flickr_export_metadata import FlickrExportMetadata
+from flickr_to_anytool.flickr_export_multipart_metadata_cache import FlickrExportMultipartMetadataCache
+from flickr_to_anytool.output_helpers import OutputHelpers
+from flickr_to_anytool.process_single_photo import ProcessSinglePhoto
+
+from .constants import INCLUDE_EXTENDED_DESCRIPTION, WRITE_XMP_SIDECARS
 
 SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.mp4', '.mov', '.avi', '.mkv'}
 
@@ -60,169 +58,7 @@ class FlickrToImmich:
         except Exception as e:
             raise ValueError(f"Error clearing output directory: {str(e)}")
 
-    def _get_destination_filename(self, photo_id: str, source_file: Path, photo_json: Optional[Dict]) -> str:
-        """Get the destination filename for a photo, without Flickr ID"""
-        try:
-            # Get original name from metadata if available
-            if photo_json and photo_json.get('name'):
-                original_name = photo_json['name'].strip()
-                # Ensure name isn't empty after stripping
-                if not original_name:
-                    original_name = source_file.name
-            else:
-                # Use the original filename
-                original_name = source_file.name
 
-            # Remove all Flickr IDs from filename
-            # Split name and extension
-            name_base, ext = os.path.splitext(original_name)
-
-            # Remove any trailing Flickr ID patterns
-            # Common patterns: name_123456789 or name_123456789_o
-            import re
-            # Remove ID patterns like _123456789 or _123456789_o
-            name_base = re.sub(r'_\d{8,11}(?:_o)?$', '', name_base)
-
-            # In case there are multiple IDs, keep removing them
-            while re.search(r'_\d{8,11}(?:_o)?', name_base):
-                name_base = re.sub(r'_\d{8,11}(?:_o)?', '', name_base)
-
-            # Reconstruct filename
-            dest_filename = f"{name_base}{ext}"
-
-            # Ensure extension is present
-            if not dest_filename.lower().endswith(source_file.suffix.lower()):
-                dest_filename = f"{dest_filename}{source_file.suffix}"
-
-            # Sanitize the filename
-            return self._sanitize_filename(dest_filename)
-
-        except Exception as e:
-            logging.error(f"Error creating destination filename for {photo_id}: {str(e)}")
-            # Fallback to a safe filename without ID
-            name_base = source_file.stem
-            # Remove any Flickr IDs from the fallback name
-            name_base = re.sub(r'_\d{8,11}(?:_o)?', '', name_base)
-            return f"{name_base}{source_file.suffix}"
-
-    # THIS SECTION ENABLES ADDITIONAL METADATA TO BE ACCESSED FROM API IN PLACE OF THE JSON FILES, WHICH ARE UNRELIABLE
-    def _get_metadata_from_api(self, photo_id: str) -> Optional[Dict]:
-        """Get metadata from Flickr API with JSON fallback"""
-        logging.debug(f"\nAttempting API fetch for photo {photo_id}")
-        logging.debug(f"Flickr API initialized: {self.flickr is not None}")
-        logging.debug(f"API Key present: {bool(os.environ.get('FLICKR_API_KEY'))}")
-
-        if not self.flickr:
-            logging.debug("No Flickr API connection, falling back to JSON")
-            return self._load_json_metadata(photo_id)
-
-        try:
-            # Load base metadata from JSON
-            metadata = self._load_json_metadata(photo_id) or {}
-
-            # Get photo info from API
-            photo_info = self.flickr.photos.getInfo(
-                api_key=os.environ['FLICKR_API_KEY'],
-                photo_id=photo_id
-            )
-
-            # Extract all API fields using dedicated methods
-            self._extract_privacy_from_api(photo_info, metadata)
-            self._extract_albums_from_api(photo_id, metadata)
-            #self._extract_orientation_from_api(photo_info, metadata)
-
-            return metadata
-
-        except Exception as e:
-            logging.debug(f"API fetch failed for photo {photo_id}, using JSON: {str(e)}")
-            return self._load_json_metadata(photo_id)
-
-    """
-    def _extract_privacy_from_api(self, photo_info, metadata: Dict):
-        #Extract privacy settings from API response using privacy level mapping
-        visibility = photo_info.find('photo/visibility')
-        if visibility is not None:
-            privacy_level = 5  # Default to private (5)
-
-            if int(visibility.get('ispublic', 0)):
-                privacy_level = 1
-            elif int(visibility.get('isfriend', 0)) and int(visibility.get('isfamily', 0)):
-                privacy_level = 4
-            elif int(visibility.get('isfriend', 0)):
-                privacy_level = 2
-            elif int(visibility.get('isfamily', 0)):
-                privacy_level = 3
-
-            # Map privacy level to string
-            privacy_map = {
-                1: 'public',
-                2: 'friends only',
-                3: 'family only',
-                4: 'friends & family',
-                5: 'private'
-            }
-            metadata['privacy'] = privacy_map[privacy_level]
-            metadata['privacy_level'] = privacy_level  # Store numeric level for reference
-
-    def _extract_albums_from_api(self, photo_id: str, metadata: Dict):
-        #Extract album information using photosets.getPhotos
-        try:
-            albums = []
-            # First get all photosets (albums) for the user
-            photosets = self.flickr.photosets.getList(
-                api_key=os.environ['FLICKR_API_KEY'],
-                user_id=self.account_data.get('nsid')
-            )
-
-            # For each photoset, check if our photo is in it
-            for photoset in photosets.findall('.//photoset'):
-                photoset_id = photoset.get('id')
-                photos = self.flickr.photosets.getPhotos(
-                    api_key=os.environ['FLICKR_API_KEY'],
-                    photoset_id=photoset_id,
-                    user_id=self.account_data.get('nsid')
-                )
-
-                # Check if our photo_id is in this photoset
-                for photo in photos.findall('.//photo'):
-                    if photo.get('id') == photo_id:
-                        albums.append(photoset.find('title').text)
-                        break  # Found in this album, no need to check rest of photos
-
-            if albums:
-                self.photo_to_albums[photo_id] = albums
-                metadata['albums'] = albums
-
-        except Exception as e:
-            logging.debug(f"Failed to get albums for {photo_id}: {str(e)}")
-    """
-
-    def _load_json_metadata(self, photo_id: str) -> Optional[Dict]:
-        """Load metadata from JSON file only"""
-        try:
-            possible_patterns = [
-                f"photo_{photo_id}.json",
-                f"{photo_id}.json",
-                f"{int(photo_id):d}.json"
-            ]
-
-            for pattern in possible_patterns:
-                photo_file = self.metadata_dir / pattern
-                if photo_file.exists():
-                    with open(photo_file, 'r', encoding='utf-8') as f:
-                        return json.load(f)
-
-            return None
-
-        except Exception as e:
-            logging.error(f"Error loading JSON metadata for photo {photo_id}: {str(e)}")
-            return None
-
-     # Replace original _load_photo_metadata with API-first version
-    _load_photo_metadata = _get_metadata_from_api
-
-
-    # END OF API METADATA
 
     def _find_unorganized_photos(self) -> Dict[str, Path]:
         """
@@ -230,12 +66,6 @@ class FlickrToImmich:
         Returns a dict mapping photo IDs to their file paths
         """
         try:
-            #logging.critical("\nTESTING LOGGING LEVELS")  # This should always show
-            #logging.error("This is an error test")       # This should show
-            #logging.warning("This is a warning test")    # This should show
-            #logging.info("This is an info test")         # This might show
-            #logging.debug("This is a debug test")        # This might show
-
             # Get all media files in photos directory
             all_photos = {}  # photo_id -> Path
             unidentified_photos = []  # Files where we couldn't extract an ID
@@ -251,10 +81,6 @@ class FlickrToImmich:
             logging.debug(f"photo_to_albums contains {len(self.photo_to_albums)} entries")
             for photo_id in list(self.photo_to_albums.keys())[:5]:  # Show first 5
                 logging.debug(f"- Photo ID {photo_id} is in albums: {self.photo_to_albums[photo_id]}")
-
-            # Get all media files in photos directory
-            all_photos = {}  # photo_id -> Path
-            unidentified_photos = []  # Files where we couldn't extract an ID
 
             logging.info("Scanning photos directory for unorganized photos...")
 
@@ -321,60 +147,6 @@ class FlickrToImmich:
             logging.exception("Full traceback:")
             return {}
 
-    def _build_photo_album_mapping(self):
-        """Build mapping of photos to their albums"""
-        try:
-            self.photo_to_albums = {}  # Initialize the dictionary
-
-            # First process all album photos
-            for album in self.albums:
-                if 'photos' not in album:
-                    logging.warning(f"Album '{album.get('title', 'Unknown')}' has no photos key")
-                    continue
-
-                for photo_id in album['photos']:
-                    if photo_id not in self.photo_to_albums:
-                        self.photo_to_albums[photo_id] = []
-                    self.photo_to_albums[photo_id].append(album['title'])
-
-            # Find and add unorganized photos to 00_NoAlbum
-            unorganized_photos = self._find_unorganized_photos()
-            if unorganized_photos:
-                # Create the 00_NoAlbum first
-                no_album = {
-                    'title': '00_NoAlbum',
-                    'description': 'Photos not organized in any Flickr album',
-                    'photos': []
-                }
-                self.albums.append(no_album)
-
-                # Add each unorganized photo to the mapping and album
-                for photo_id, file_path in unorganized_photos.items():
-                    self.photo_to_albums[photo_id] = ['00_NoAlbum']
-                    no_album['photos'].append(photo_id)  # Add to the album's photo list
-
-                # Store the file paths for unorganized photos for later use
-                self.unorganized_photo_paths = unorganized_photos
-
-                total_photos = len(self.photo_to_albums)
-                organized_count = sum(1 for p in self.photo_to_albums.values() if '00_NoAlbum' not in p)
-                unorganized_count = len(unorganized_photos)
-
-                logging.info(f"Photo organization summary:")
-                logging.info(f"- Total photos: {total_photos}")
-                logging.info(f"- In albums: {organized_count}")
-                logging.info(f"- Not in albums: {unorganized_count}")
-                logging.info(f"- Added to 00_NoAlbum: {len(no_album['photos'])}")
-
-            else:
-                logging.info("All photos are organized in albums")
-
-        except Exception as e:
-            logging.error(f"Error building photo-album mapping: {str(e)}")
-            logging.exception("Full traceback:")
-            self.photo_to_albums = {}  # Initialize empty if there's an error
-            raise
-
     def __init__(self,
                     metadata_dir: str,
                     photos_dir: str,
@@ -390,6 +162,7 @@ class FlickrToImmich:
                     resume: bool = False,
                     use_api: bool = False,
                     quiet: bool = False,
+                    debug: bool = False,
                     fave_weight: float = 10.0,
                     comment_weight: float = 3.0,
                     view_weight: float = 5.0,
@@ -397,9 +170,22 @@ class FlickrToImmich:
                     min_faves: int = 2,
                     min_comments: int = 0,
                     cpu_cores: int = 4,
-                    chunk_size: int = 100,
                     batch_size: int = 1000,
                     max_memory_percent: int = 75):
+
+            """
+            Initialize the converter with source and destination directories
+
+            Args:
+                metadata_dir: Directory containing Flickr export JSON files
+                photos_dir: Directory containing the photos and videos
+                output_dir: Directory where the album structure will be created
+                api_key: Optional Flickr API key for additional metadata
+                log_file: Optional path to log file
+                include_extended_description: Whether to include extended metadata in description
+                write_xmp_sidecars: Whether to write XMP sidecar files
+                quiet: Whether to reduce console output (default: False)
+            """
 
             # First, set all parameters as instance attributes
             self.block_if_failure = block_if_failure
@@ -411,6 +197,8 @@ class FlickrToImmich:
             self.max_memory = (total_memory * max_memory_percent) // 100
             self.batch_size = batch_size
             self.cpu_cores = cpu_cores
+            self.include_extended_description = include_extended_description
+            self.write_xmp_sidecars = write_xmp_sidecars
 
             logging.info(f"Maximum memory set to {self.max_memory / (1024*1024*1024):.1f}GB "
                         f"({max_memory_percent}% of system memory)")
@@ -439,53 +227,20 @@ class FlickrToImmich:
                 'skipped': {
                     'count': 0,
                     'details': set()  # Will store (file, reason) tuples
-                }
+                },
+                'errors': []
             }
 
-            """
-            Initialize the converter with source and destination directories
-
-            Args:
-                metadata_dir: Directory containing Flickr export JSON files
-                photos_dir: Directory containing the photos and videos
-                output_dir: Directory where the album structure will be created
-                api_key: Optional Flickr API key for additional metadata
-                log_file: Optional path to log file
-                include_extended_description: Whether to include extended metadata in description
-                write_xmp_sidecars: Whether to write XMP sidecar files
-                quiet: Whether to reduce console output (default: False)
-            """
-
-            # Set debug logging level
-            #logging.getLogger().setLevel(logging.DEBUG)
-            #logging.debug("Debug logging enabled")
-
-            # Configure a stream handler to show debug messages
-            console_handler = logging.StreamHandler()
-            console_handler.setLevel(logging.WARNING)
-            formatter = logging.Formatter('%(levelname)s - %(message)s')
-            console_handler.setFormatter(formatter)
-            logging.getLogger().addHandler(console_handler)
-
-            # First, set all parameters as instance attributes
-            self.block_if_failure = block_if_failure
-            self.resume = resume  # Explicitly set the resume attribute
-            self.date_format = date_format  # Also set date_format
-            self.quiet = quiet
-
-            self.include_extended_description = include_extended_description
-            self.write_xmp_sidecars = write_xmp_sidecars
-
             # Setup logging with quiet parameter
-            self._setup_logging(log_file, quiet)
-
-            self.resume = resume
+            self._setup_logging(log_file, quiet, debug)
 
             # Initialize directories
             self.metadata_dir = Path(metadata_dir)
             self.photos_dir = Path(photos_dir)
             self.output_dir = Path(output_dir)
             self.results_dir = Path(results_dir) if results_dir else self.output_dir
+
+            self.flickr_export_metadata: FlickrExportMetadata = FlickrExportMetadata(self.metadata_dir)
 
             # Clear output directory if not resuming
             if not self.resume:
@@ -513,27 +268,12 @@ class FlickrToImmich:
             self.min_faves = min_faves
             self.min_comments = min_comments
 
-    #       # Validate directories
-    #       self._validate_directories()
+            # Validate directories
+            self._validate_directories()
 
             # Initialize Flickr API if key is provided
-            self.flickr = None
-            self.user_info_cache = {}
-            if api_key and api_secret:
-                try:
-                    self.flickr = flickrapi.FlickrAPI(api_key, api_secret, format='etree')
-                    logging.getLogger('flickrapi').setLevel(logging.ERROR)
-                    if not self.flickr.token_valid(perms='read'):
-                        self.flickr.get_request_token(oauth_callback='oob')
-                        authorize_url = self.flickr.auth_url(perms='read')
-                        print(f"\nAuthorise this app by opening the following URL in your browser:\n{authorize_url}\n")
-                        verifier = input("Enter the verifier code from Flickr: ").strip()
-                        self.flickr.get_access_token(verifier)
-                    logging.info("Successfully authenticated with Flickr API")
-                except Exception as e:
-                    logging.warning(f"Failed to authenticate with Flickr API: {e}")
-                    logging.warning("Comments and favorites lookup will be limited")
-                    self.flickr = None
+            self.flickr_wrapper = FlickrApiMetadata.auth(api_key, api_secret)
+
             try:
                 # Debug: List ALL files in metadata directory
                 logging.info("=== DIRECTORY CONTENTS ===")
@@ -546,19 +286,15 @@ class FlickrToImmich:
                 self._load_account_profile()
 
                 # Load all data, handling both single and multi-part files
-                self.contacts = self._load_multipart_json("contacts", "contacts")
-                self.comments = self._load_multipart_json("comments", "comments")
-                self.favorites = self._load_multipart_json("faves", "faves")
-                self.followers = self._load_multipart_json("followers", "followers")
-                self.galleries = self._load_multipart_json("galleries", "galleries")
-                self.apps_comments = self._load_multipart_json("apps_comments", "comments")
-                self.gallery_comments = self._load_multipart_json("galleries_comments", "comments")
-
-                # Process user mappings from loaded contacts data
-                self._process_user_mappings()
+                # self.comments = FlickrExportMultipartMetadataCache(self.metadata_dir, "comments", "comments").data()
+                # self.favorites = FlickrExportMultipartMetadataCache(self.metadata_dir, "faves", "faves").data()
+                # self.followers = FlickrExportMultipartMetadataCache(self.metadata_dir, "followers", "followers").data()
+                # self.galleries = FlickrExportMultipartMetadataCache(self.metadata_dir, "galleries", "galleries").data()
+                # self.apps_comments = FlickrExportMultipartMetadataCache(self.metadata_dir, "apps_comments", "comments").data()
+                # self.gallery_comments = FlickrExportMultipartMetadataCache(self.metadata_dir, "galleries_comments", "comments").data()
 
                 # Load albums (could be single or multi-part)
-                self.albums = self._load_multipart_json("albums", "albums")
+                self.albums = FlickrExportMultipartMetadataCache(self.metadata_dir, "albums", "albums").data()
                 if not isinstance(self.albums, list):
                     logging.error("Albums data is not in expected list format")
                     raise ValueError("Invalid albums data format")
@@ -589,23 +325,20 @@ class FlickrToImmich:
                 logging.error(f"Initialization failed: {str(e)}")
                 raise
 
-    def _validate_directories(self):
-        """Validate input and output directories"""
-        if not self.metadata_dir.exists():
-            raise ValueError(f"Metadata directory does not exist: {self.metadata_dir}")
-
-        if not self.photos_dir.exists():
-            raise ValueError(f"Photos directory does not exist: {self.photos_dir}")
-
-        # Create output directory if it doesn't exist
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def _setup_logging(self, log_file: Optional[str], quiet: bool = False):
+    def _setup_logging(self, log_file: Optional[str], quiet: bool, debug: bool):
         """Configure logging with both file and console output"""
+
+
+        if debug:
+            log_level = logging.DEBUG
+        elif quiet:
+            log_level = logging.WARNING
+        else:
+            log_level = logging.INFO
 
         # Set up root logger
         root_logger = logging.getLogger()
-        root_logger.setLevel(logging.CRITICAL)  # Set to DEBUG to capture all levels
+        root_logger.setLevel(log_level)  # Set to DEBUG to capture all levels
 
         # Remove any existing handlers
         for handler in root_logger.handlers[:]:
@@ -617,7 +350,7 @@ class FlickrToImmich:
 
         # Set up minimal console output
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.CRITICAL)
+        console_handler.setLevel(log_level)
         root_logger.addHandler(console_handler)
 
         # Only set up file logging if specifically requested
@@ -700,140 +433,6 @@ class FlickrToImmich:
         except Exception as e:
             logging.error(f"Error writing results log: {str(e)}")
 
-
-    def _find_json_files(self, base_name: str) -> List[Path]:
-        """Find JSON files matching various patterns"""
-        # Move debug logging to logging.debug level
-        logging.debug(f"Searching for {base_name} files")
-
-        patterns = [
-            f"{base_name}.json",
-            f"{base_name}_part*.json",
-            f"{base_name}*.json"
-        ]
-
-        matching_files = []
-        for pattern in patterns:
-            files = list(self.metadata_dir.glob(pattern))
-            if files:
-                logging.debug(f"Found {len(files)} files matching pattern {pattern}")
-                for f in files:
-                    logging.debug(f"  - {f.name}")
-                matching_files.extend(files)
-
-        unique_files = sorted(set(matching_files))
-
-        if not unique_files:
-            logging.debug(f"No {base_name} files found with any pattern")
-        else:
-            logging.debug(f"Found {len(unique_files)} unique {base_name} files")
-
-        return unique_files
-
-    def _load_multipart_json(self, base_name: str, key: str) -> Union[Dict, List]:
-        """
-        Load and merge JSON data from files with various naming patterns
-
-        Args:
-            base_name: Base name without extension (e.g., 'albums')
-            key: The key in the JSON that contains the data we want
-
-        Returns:
-            Either a merged dictionary or list, depending on the data structure
-        """
-        logging.info(f"Loading {base_name} files...")
-        data_files = self._find_json_files(base_name)
-        total_files = len(data_files)
-
-        for i, data_file in enumerate(data_files, 1):
-            logging.info(f"Processing file {i}/{total_files} ({(i/total_files)*100:.1f}%)")
-
-        data_files = self._find_json_files(base_name)
-
-        if not data_files:
-            logging.warning(f"No {base_name} files found")
-            return {} if base_name != "albums" else []  # Return empty dict or list based on type
-
-        try:
-            # First file determines the data structure
-            with open(data_files[0], 'r', encoding='utf-8') as f:
-                first_file_data = json.load(f)
-                if key not in first_file_data:
-                    logging.warning(f"Key '{key}' not found in first file {data_files[0].name}")
-                    return {} if base_name != "albums" else []
-
-                # Initialize with appropriate type
-                if isinstance(first_file_data[key], dict):
-                    merged_data = {}
-                else:  # List type
-                    merged_data = []
-
-            # Now process all files
-            for data_file in data_files:
-                logging.info(f"Processing {data_file.name}")
-                with open(data_file, 'r', encoding='utf-8') as f:
-                    file_data = json.load(f)
-                    if key in file_data:
-                        if isinstance(merged_data, dict):
-                            # Dictionary merge
-                            merged_data.update(file_data[key])
-                        else:
-                            # List merge
-                            merged_data.extend(file_data[key])
-                        logging.info(f"Loaded {len(file_data[key])} entries from {data_file.name}")
-                    else:
-                        logging.warning(f"Key '{key}' not found in {data_file.name}")
-
-            count = len(merged_data) if isinstance(merged_data, (dict, list)) else 1
-            files_word = "files" if len(data_files) > 1 else "file"
-            logging.info(f"Loaded total {count} entries from {len(data_files)} {base_name} {files_word}")
-            return merged_data
-
-        except Exception as e:
-            logging.error(f"Error loading {base_name}: {str(e)}")
-            return {} if base_name != "albums" else []
-
-    def _get_user_info(self, user_id: str) -> Tuple[str, str]:
-        """
-        Get username and real name for a user ID using Flickr API
-        Returns tuple of (username, realname)
-        If API is unavailable or user not found, returns (user_id, "")
-        """
-        # Check cache first
-        if user_id in self.user_info_cache:
-            return self.user_info_cache[user_id]
-
-        # Fall back to just user_id if no API available
-        if not self.flickr:
-            return (user_id, "")
-
-        try:
-            # Call Flickr API
-            user_info = self.flickr.people.getInfo(api_key=os.environ['FLICKR_API_KEY'], user_id=user_id)
-
-            # Parse response
-            person = user_info.find('person')
-            if person is None:
-                raise ValueError("No person element found in response")
-
-            username = person.find('username').text
-            realname = person.find('realname')
-            realname = realname.text if realname is not None else ""
-
-            # Cache the result
-            self.user_info_cache[user_id] = (username, realname)
-            return (username, realname)
-
-        except Exception as e:
-            logging.warning(f"Failed to get user info for {user_id}: {e}")
-            return (user_id, "")
-
-
-    def _get_username(self, user_id: str) -> str:
-        """Get username for a user ID, falling back to ID if not found"""
-        username, _ = self._get_user_info(user_id)
-        return username
-
     def _load_account_profile(self):
         """Load the account profile data with progress indication"""
         with tqdm(total=100, desc="Loading account profile", unit="%") as pbar:
@@ -874,405 +473,6 @@ class FlickrToImmich:
                 self.account_data = {}
                 pbar.update(100)  # Complete the progress bar
 
-    def _process_user_mappings(self):
-        """Process user mappings from loaded contacts data"""
-        try:
-            for username, url in self.contacts.items():
-                # Extract user ID from URL, handling different URL formats
-                if '/people/' in url:
-                    user_id = url.split('/people/')[1].strip('/')
-                else:
-                    user_id = url.strip()
-
-                # Store both the full ID and the cleaned version (without @N00 if present)
-                self.user_mapping[user_id] = username
-                if '@' in user_id:
-                    clean_id = user_id.split('@')[0]
-                    self.user_mapping[clean_id] = username
-
-            logging.info(f"Processed {len(self.user_mapping)} user mappings")
-            # Log first few mappings to help with debugging
-            sample_mappings = dict(list(self.user_mapping.items())[:3])
-            logging.info(f"Sample user mappings: {sample_mappings}")
-        except Exception as e:
-            logging.error(f"Error processing user mappings: {str(e)}")
-
-    def _get_photo_favorites(self, photo_id: str) -> List[Dict]:
-        """Fetch list of users who favorited a photo using Flickr API"""
-        if not self.flickr:
-            return []
-
-        try:
-            favorites = []
-            page = 1
-            per_page = 50
-
-            while True:
-                try:
-                    # Get favorites for current page
-                    response = self.flickr.photos.getFavorites(
-                        api_key=os.environ['FLICKR_API_KEY'],
-                        photo_id=photo_id,
-                        page=page,
-                        per_page=per_page
-                    )
-
-                    # Extract person elements
-                    photo_elem = response.find('photo')
-                    if photo_elem is None:
-                        break
-
-                    person_elems = photo_elem.findall('person')
-                    if not person_elems:
-                        break
-
-                    # Process each person
-                    for person in person_elems:
-                        username = person.get('username', '')
-                        nsid = person.get('nsid', '')
-                        favedate = person.get('favedate', '')
-
-                        # Convert favedate to readable format
-                        if favedate:
-                            try:
-                                favedate = datetime.fromtimestamp(int(favedate)).strftime('%Y-%m-%d %H:%M:%S')
-                            except:
-                                pass  # Keep original if conversion fails
-
-                        favorites.append({
-                            'username': username,
-                            'nsid': nsid,
-                            'favedate': favedate
-                        })
-
-                    # Check if we've processed all pages
-                    total_pages = int(photo_elem.get('pages', '1'))
-                    if page >= total_pages:
-                        break
-
-                    page += 1
-
-                except Exception as e:
-                    # If we encounter an error on a specific page, log it at debug level and break
-                    logging.debug(f"Error fetching favorites page {page} for photo {photo_id}: {str(e)}")
-                    break
-
-            return favorites
-
-        except Exception as e:
-            # Log at debug level instead of warning since this is expected for some photos
-            logging.debug(f"Failed to get favorites for photo {photo_id}: {str(e)}")
-            return []
-
-    def _fetch_user_interesting_photos(self, time_period: str, per_page: int = 100) -> List[Dict]:
-        """Process user's photos and sort by engagement metrics"""
-        try:
-            print("\nAnalyzing photos for engagement metrics...")
-
-            # Use pre-loaded metadata cache instead of re-reading files
-            interesting_photos = []
-
-            # Create temporary file for storing results
-            temp_results_file = self.output_dir / "temp_highlights.json"
-
-            # If resuming and temp file exists, load previous results
-            if self.resume and temp_results_file.exists():
-                try:
-                    with open(temp_results_file, 'r') as f:
-                        return json.load(f)
-                except Exception:
-                    pass  # If loading fails, continue with normal processing
-
-            total_files = len(self.photo_id_map)
-            processed = 0
-            meeting_criteria = 0
-
-            print(f"Processing {total_files} photos")
-            print("Parameters:")
-            print(f"- Views: min {self.min_views} (weight: {self.view_weight})")
-            print(f"- Favorites: min {self.min_faves} (weight: {self.fave_weight})")
-            print(f"- Comments: min {self.min_comments} (weight: {self.comment_weight})")
-
-            # Process metadata from cache
-            for photo_id in self.photo_id_map:
-                processed += 1
-
-                # Load metadata for each photo
-                photo_metadata = self._load_json_metadata(photo_id)
-                if not photo_metadata:
-                    continue
-
-                if processed % 1000 == 0:
-                    print(f"\rAnalyzing: {processed}/{total_files} ({(processed/total_files)*100:.1f}%) - "
-                        f"Found {meeting_criteria} matching photos", end='')
-                    sys.stdout.flush()
-
-                try:
-                    # Get metrics with default values
-                    faves = int(photo_metadata.get('count_faves', 0))
-                    comments = int(photo_metadata.get('count_comments', 0))
-                    views = int(photo_metadata.get('count_views', 0))
-
-                    # Check if meets criteria
-                    if (views >= self.min_views or
-                        faves >= self.min_faves or
-                        comments >= self.min_comments):
-
-                        # Calculate score
-                        interestingness_score = (
-                            (faves * self.fave_weight) +
-                            (comments * self.comment_weight) +
-                            (views * self.view_weight)
-                        )
-
-                        # Get source file from pre-loaded map
-                        source_file = self.photo_id_map.get(photo_id)
-                        if not source_file:
-                            continue
-
-                        photo_data = {
-                            'id': photo_id,
-                            'title': photo_metadata.get('name', ''),
-                            'description': photo_metadata.get('description', ''),
-                            'date_taken': photo_metadata.get('date_taken', ''),
-                            'license': photo_metadata.get('license', ''),
-                            'fave_count': faves,
-                            'comment_count': comments,
-                            'count_views': views,
-                            'interestingness_score': interestingness_score,
-                            'original_file': str(source_file),
-                            'original': str(source_file),
-                            'privacy': photo_metadata.get('privacy', ''),
-                            'safety': photo_metadata.get('safety', '')
-                        }
-                        interesting_photos.append(photo_data)
-                        meeting_criteria += 1
-
-                except Exception as e:
-                    continue
-
-            print(f"\n\nFound {meeting_criteria} photos meeting criteria")
-
-            if interesting_photos:
-                # Sort by score
-                interesting_photos.sort(key=lambda x: x['interestingness_score'], reverse=True)
-                interesting_photos = interesting_photos[:per_page]
-
-                # Save results to temp file
-                try:
-                    with open(temp_results_file, 'w') as f:
-                        json.dump(interesting_photos, f)
-                except Exception:
-                    pass  # Continue even if saving fails
-
-                return interesting_photos
-
-            return []
-
-        except Exception as e:
-            print(f"Error analyzing photos: {str(e)}")
-            return []
-
-        finally:
-            # Cleanup
-            if 'temp_results_file' in locals() and temp_results_file.exists():
-                try:
-                    temp_results_file.unlink()
-                except Exception:
-                    pass
-
-    def create_interesting_albums(self, time_period: str, photo_count: int = 100):
-        """Create albums of user's most engaging photos"""
-        try:
-            # Create highlights_only parent directory
-            highlights_dir = self.output_dir / "highlights_only"
-            print(f"\nCreating highlights directory: {highlights_dir}")
-            sys.stdout.flush()
-
-            highlights_dir.mkdir(parents=True, exist_ok=True)
-
-            # Get photos with engagement metrics
-            print("\nAnalyzing photos for engagement metrics...")
-            sys.stdout.flush()
-
-            all_photos = self._fetch_user_interesting_photos(time_period, photo_count)
-            if not all_photos:
-                print("No photos found meeting engagement criteria")
-                return
-
-            print(f"\nFound {len(all_photos)} photos to process")
-            print("Creating highlight albums...")
-            sys.stdout.flush()
-
-            # Initialize privacy groups
-            privacy_groups = {
-                'private': [],
-                'friends & family': [],
-                'friends only': [],
-                'family only': [],
-                'public': []
-            }
-
-            # Process each photo
-            for photo in all_photos:
-                # Get privacy value and normalize it
-                raw_privacy = photo.get('privacy', '').lower().strip()
-
-                # Map privacy values
-                privacy_mapping = {
-                    'private': 'private',
-                    'friend & family': 'friends & family',
-                    'friends & family': 'friends & family',
-                    'friends&family': 'friends & family',
-                    'friendandfamily': 'friends & family',
-                    'friend and family': 'friends & family',
-                    'friends and family': 'friends & family',
-                    'friends': 'friends only',
-                    'friend': 'friends only',
-                    'family': 'family only',
-                    'public': 'public',
-                    '': 'private'
-                }
-
-                normalized_privacy = privacy_mapping.get(raw_privacy, 'private')
-                privacy_groups[normalized_privacy].append(photo)
-
-            # Create albums for each privacy group
-            total_exported = 0
-            for privacy_type, photos in privacy_groups.items():
-                if photos:
-                    print(f"\nProcessing {len(photos)} {privacy_type} photos...")
-                    sys.stdout.flush()
-
-                    folder_name = f"0{list(privacy_groups.keys()).index(privacy_type) + 1}_{privacy_type.replace(' ', '_').title()}_Highlights"
-
-                    try:
-                        self._create_single_interesting_album(
-                            highlights_dir,
-                            folder_name,
-                            f"Your most engaging {privacy_type} Flickr photos",
-                            photos
-                        )
-                        total_exported += len(photos)
-                    except Exception as e:
-                        print(f"Error creating album {folder_name}: {str(e)}")
-                        continue
-
-            print(f"\nHighlight albums creation complete!")
-            print(f"Total photos exported: {total_exported}")
-            sys.stdout.flush()
-
-        except Exception as e:
-            error_msg = f"Error creating highlight albums: {str(e)}"
-            print(error_msg)
-            print(traceback.format_exc())
-            logging.error(error_msg)
-            raise
-
-    def _create_single_interesting_album(self, highlights_dir: Path, folder_name: str, description: str, photos: List[Dict]):
-        """Create a single album of engaging photos"""
-        try:
-            # Create folder for this privacy level
-            album_dir = highlights_dir / folder_name
-            album_dir.mkdir(parents=True, exist_ok=True)
-
-            total_photos = len(photos)
-            print(f"Processing {total_photos} photos for {folder_name}")
-            sys.stdout.flush()
-
-            # Update total files stat
-            self.stats['total_files'] += total_photos
-
-            processed = 0
-            for i, photo in enumerate(photos, 1):
-                try:
-                    source_file = photo['original_file']
-                    if not isinstance(source_file, Path):
-                        source_file = Path(source_file)
-
-                    if not source_file.exists():
-                        self.stats['skipped']['count'] += 1
-                        self.stats['skipped']['details'].append(
-                            (str(source_file), "Source file not found")
-                        )
-                        continue
-
-                    # Create filename without Flickr ID
-                    if photo['title']:
-                        safe_title = self._sanitize_folder_name(photo['title'])
-                        photo_filename = f"{safe_title}{source_file.suffix}"
-                    else:
-                        photo_filename = self._get_destination_filename(photo['id'], source_file, photo)
-
-                    dest_file = album_dir / photo_filename
-
-                    # Handle filename conflicts
-                    counter = 1
-                    base_name = dest_file.stem
-                    extension = dest_file.suffix
-                    while dest_file.exists():
-                        dest_file = album_dir / f"{base_name}_{counter}{extension}"
-                        counter += 1
-
-                    if i % 5 == 0 or i == total_photos:
-                        print(f"\r{folder_name}: {i}/{total_photos} ({(i/total_photos)*100:.1f}%)", end='')
-                        sys.stdout.flush()
-
-                    # Copy file
-                    shutil.copy2(source_file, dest_file)
-
-                    # Prepare metadata
-                    photo_metadata = photo.copy()
-                    photo_metadata['original_file'] = str(source_file)
-                    photo_metadata['original'] = str(source_file)
-
-                    # Add engagement metrics to metadata
-                    photo_metadata['engagement'] = {
-                        'rank': i,
-                        'total_ranked': total_photos,
-                        'favorites': photo['fave_count'],
-                        'comments': photo['comment_count'],
-                        'views': photo.get('count_views', 0)
-                    }
-
-                    # Ensure photopage exists
-                    if 'photopage' not in photo_metadata:
-                        photo_metadata['photopage'] = f"https://www.flickr.com/photos/{self.account_data.get('nsid', '')}/{photo['id']}"
-
-                    # Embed metadata based on media type
-                    media_type = self.get_media_type(dest_file)
-                    if media_type == MediaType.IMAGE:
-                        self._embed_image_metadata(dest_file, photo_metadata)
-                    elif media_type == MediaType.VIDEO:
-                        self._embed_video_metadata(dest_file, photo_metadata)
-
-                    if self.write_xmp_sidecars:
-                        self._write_xmp_sidecar(dest_file, photo_metadata)
-
-                    processed += 1
-                    self.stats['successful']['count'] += 1
-                    self.stats['successful']['details'].append(
-                        (str(source_file), str(dest_file), "Highlight photo processed successfully")
-                    )
-
-                except Exception as e:
-                    error_msg = f"Error processing highlight photo {photo.get('id', 'unknown')}: {str(e)}"
-                    self.stats['failed']['count'] += 1
-                    self.stats['failed']['details'].append(
-                        (str(source_file) if 'source_file' in locals() else "unknown", error_msg)
-                    )
-                    logging.error(error_msg)
-                    continue
-
-            print(f"\nCompleted {folder_name}: {processed}/{total_photos} photos processed successfully")
-            sys.stdout.flush()
-
-        except Exception as e:
-            error_msg = f"Error creating album {folder_name}: {str(e)}"
-            print(error_msg)
-            logging.error(error_msg)
-            raise
-
     def _validate_directories(self):
         """Validate input and output directories"""
         if not self.metadata_dir.exists():
@@ -1283,6 +483,54 @@ class FlickrToImmich:
 
         # Create output directory if it doesn't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _extract_photo_id(self, filename: str) -> Optional[str]:
+        """
+        Extract photo ID from filename and verify against metadata existence.
+        Returns the ID that has matching metadata.
+        """
+        #print(f"Attempting to extract ID from: {filename}")  # Add this line
+        # Convert filename to lowercase for consistent matching
+        filename = filename.lower()
+
+        # Find ALL potential IDs in the filename, including those not following _o pattern
+        import re
+        # Updated pattern to catch more ID variations
+        patterns = [
+            r'_(\d{8,11})(?:_o)?(?:\.|_)',  # Standard pattern
+            r'[^0-9](\d{8,11})[^0-9]',      # Any 8-11 digit number
+        ]
+
+        all_matches = set()
+        for pattern in patterns:
+            matches = re.findall(pattern, filename)
+            all_matches.update(matches)
+
+        if not all_matches:
+            return None
+
+        # Convert matches to list and sort by length (to prioritize consistent length IDs)
+        matches = sorted(all_matches, key=len, reverse=True)
+
+        if len(matches) >= 1:
+            # First, try to find metadata for any of the IDs
+            for photo_id in matches:
+                if self._find_metadata_file(photo_id):
+                    if len(matches) > 1:
+                        logging.debug(f"Multiple IDs in {filename}, using {photo_id} (found metadata)")
+                    return photo_id
+
+            # If no metadata found but we have multiple IDs, use the largest (most recent) one
+            if len(matches) > 1:
+                largest_id = str(max(int(id_) for id_ in matches))
+                logging.debug(f"No metadata found for any ID in {filename}, using largest: {largest_id}")
+                return largest_id
+
+            # If single ID, return it even if no metadata (for consistent behavior)
+            return matches[0]
+
+        return None
+
 
     def _find_metadata_file(self, photo_id: str) -> Optional[Path]:
         """Helper method to find metadata file for a given ID"""
@@ -1296,79 +544,6 @@ class FlickrToImmich:
             if metadata_file.exists():
                 return metadata_file
         return None
-
-    def _extract_photo_id(self, filename: str) -> Optional[str]:
-        """
-        Extract photo ID from filename and verify against metadata existence.
-        Returns the ID that has matching metadata.
-        """
-        try:
-            #print(f"Attempting to extract ID from: {filename}")  # Add this line
-            # Convert filename to lowercase for consistent matching
-            filename = filename.lower()
-
-            # Find ALL potential IDs in the filename, including those not following _o pattern
-            import re
-            # Updated pattern to catch more ID variations
-            patterns = [
-                r'_(\d{10,11})(?:_o)?(?:\.|_)',  # Standard pattern
-                r'[^0-9](\d{10,11})[^0-9]',      # Any 10-11 digit number
-            ]
-
-            all_matches = set()
-            for pattern in patterns:
-                matches = re.findall(pattern, filename)
-                all_matches.update(matches)
-
-            if not all_matches:
-                return None
-
-            # Convert matches to list and sort by length (to prioritize consistent length IDs)
-            matches = sorted(all_matches, key=len, reverse=True)
-
-            if len(matches) >= 1:
-                # First, try to find metadata for any of the IDs
-                for photo_id in matches:
-                    if self._find_metadata_file(photo_id):
-                        if len(matches) > 1:
-                            logging.debug(f"Multiple IDs in {filename}, using {photo_id} (found metadata)")
-                        return photo_id
-
-                # If no metadata found but we have multiple IDs, use the largest (most recent) one
-                if len(matches) > 1:
-                    largest_id = str(max(int(id_) for id_ in matches))
-                    logging.debug(f"No metadata found for any ID in {filename}, using largest: {largest_id}")
-                    return largest_id
-
-                # If single ID, return it even if no metadata (for consistent behavior)
-                return matches[0]
-
-            return None
-
-        except Exception as e:
-            logging.warning(f"Error extracting photo ID from {filename}: {str(e)}")
-            return None
-
-    def _load_albums(self) -> dict:
-        """Load and parse albums data (single or multi-part)"""
-        try:
-            # Try multi-part first
-            albums_data = self._load_multipart_json("albums_part*.json", "albums")
-            if albums_data:
-                return albums_data
-
-            # Fall back to single file if no multi-part files found
-            albums_file = self.metadata_dir / 'albums.json'
-            if not albums_file.exists():
-                raise FileNotFoundError(f"No albums files found in {self.metadata_dir}")
-
-            with open(albums_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if 'albums' not in data:
-                    raise ValueError("Invalid albums.json format: 'albums' key not found")
-                return data['albums']
-        except Exception as e:
-            raise ValueError(f"Error loading albums data: {str(e)}")
 
     def _build_photo_album_mapping(self):
         """Build mapping of photos to their albums"""
@@ -1404,16 +579,6 @@ class FlickrToImmich:
         except Exception as e:
             raise ValueError(f"Error building photo-album mapping: {str(e)}")
 
-    def get_media_type(self, file_path: Path) -> MediaType:
-        """Determine the type of media file"""
-        mime_type, _ = mimetypes.guess_type(str(file_path))
-        if mime_type:
-            if mime_type.startswith('image/'):
-                return MediaType.IMAGE
-            elif mime_type.startswith('video/'):
-                return MediaType.VIDEO
-        return MediaType.UNKNOWN
-
 
     def create_album_structure(self) -> Path:
         """Create the album folder structure and return working directory"""
@@ -1432,7 +597,7 @@ class FlickrToImmich:
             # Create album directories under by_album
             if hasattr(self, 'albums'):
                 for album in self.albums:
-                    album_dir = full_export_dir / self._sanitize_folder_name(album['title'])
+                    album_dir = full_export_dir / OutputHelpers.sanitize_folder_name(album['title'])
                     album_dir.mkdir(parents=True, exist_ok=True)
 
                     if not album_dir.exists():
@@ -1474,138 +639,88 @@ class FlickrToImmich:
             logging.error(error_msg)
             raise
 
-    def _get_date_path(self, date_str: str, date_format: str) -> Path:
-        """Convert date string to folder path based on format"""
-        try:
-            date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
-
-            if date_format == 'yyyy/yyyy-mm-dd':
-                return Path(f"{date.year}/{date.year:04d}-{date.month:02d}-{date.day:02d}")
-            elif date_format == 'yyyy/yyyy-mm':
-                return Path(f"{date.year}/{date.year:04d}-{date.month:02d}")
-            elif date_format == 'yyyy-mm-dd':
-                return Path(f"{date.year:04d}-{date.month:02d}-{date.day:02d}")
-            elif date_format == 'yyyy-mm':
-                return Path(f"{date.year:04d}-{date.month:02d}")
-            elif date_format == 'yyyy':
-                return Path(f"{date.year:04d}")
-            else:
-                raise ValueError(f"Unsupported date format: {date_format}")
-
-        except Exception as e:
-            logging.error(f"Error processing date {date_str}: {str(e)}")
-            return Path("unknown_date")
-
-    def _sanitize_folder_name(self, name: str) -> str:
-        """Convert filename/foldername to safe version"""
-        # Replace spaces with underscores and remove/replace special characters
-        sanitized = "".join(c if c.isalnum() or c in ('_', '-') else '_'
-                        for c in name.replace(' ', '_'))
-
-        # Remove multiple consecutive underscores
-        sanitized = re.sub(r'_+', '_', sanitized)
-
-        # Remove leading/trailing underscores
-        sanitized = sanitized.strip('_')
-
-        # Ensure name isn't empty
-        if not sanitized:
-            sanitized = "unnamed"
-        return sanitized
-
     def process_photos(self, organization: str, date_format: str = None):
         """Process photos with enhanced debugging"""
-        try:
-            self.unique_total = len(set(self.photo_to_albums.keys()))
-            self.start_time = time.time()
+        self.unique_total = len(set(self.photo_to_albums.keys()))
+        self.start_time = time.time()
 
-            print(f"\nProcessing {self.unique_total} photos")
-            sys.stdout.flush()
+        print(f"\nProcessing {self.unique_total} photos")
+        sys.stdout.flush()
 
-            if organization == 'by_date':
-                working_dir = self.create_date_structure(date_format)
-            else:
-                working_dir = self.create_album_structure()
+        if organization == 'by_date':
+            working_dir = self.create_date_structure(date_format)
+        else:
+            working_dir = self.create_album_structure()
 
-            photo_items = list(self.photo_to_albums.items())
-            total_processed = 0
+        photo_items = list(self.photo_to_albums.items())
+        total_processed = 0
+        exif_writer = ExifWriter(self.flickr_wrapper, self.photo_to_albums, self.account_data, self.include_extended_description, self.write_xmp_sidecars)
+        processor = ProcessSinglePhoto(self.photo_id_map, exif_writer, self.flickr_export_metadata, self.failed_dir, date_format, self.write_xmp_sidecars)
 
-            for batch_idx, batch_start in enumerate(range(0, len(photo_items), self.batch_size), 1):
-                batch_end = min(batch_start + self.batch_size, len(photo_items))
-                current_batch = photo_items[batch_start:batch_end]
+        for batch_idx, batch_start in enumerate(range(0, len(photo_items), self.batch_size), 1):
+            batch_end = min(batch_start + self.batch_size, len(photo_items))
+            current_batch = photo_items[batch_start:batch_end]
 
-                with ThreadPoolExecutor(max_workers=self.cpu_cores) as executor:
-                    futures = []
-                    for photo_id, albums in current_batch:
-                        if organization == 'by_date':
-                            future = executor.submit(
-                                self._process_single_photo_by_date,
-                                photo_id, date_format, working_dir
-                            )
-                        else:
-                            future = executor.submit(
-                                self._process_single_photo,
-                                (photo_id, albums, working_dir)
-                            )
-                        futures.append((future, photo_id))
-
-                    # Process results for this batch
-                    for future, photo_id in futures:
-                        try:
-                            result = future.result()
-                            if result and isinstance(result, tuple):
-                                source_file, dest_file = result
-                                if dest_file and dest_file.exists():
-                                    self.unique_successful.add(photo_id)
-                                else:
-                                    self.unique_failed.add(photo_id)
-                            else:
-                                self.unique_failed.add(photo_id)
-
-                            total_processed += 1
-
-                        except Exception as e:
-                            self.unique_failed.add(photo_id)
-                            total_processed += 1
-
-                    # Update progress after processing batch
-                    elapsed_time = time.time() - self.start_time
-                    photos_per_second = total_processed / elapsed_time if elapsed_time > 0 else 0
-                    remaining_photos = self.unique_total - total_processed
-                    estimated_remaining = remaining_photos / photos_per_second if photos_per_second > 0 else 0
-
-                    elapsed = time.strftime('%H:%M:%S', time.gmtime(elapsed_time))
-                    remaining = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining))
-
-                    # Show current batch info and overall progress
+            with ThreadPoolExecutor(max_workers=self.cpu_cores) as executor:
+                futures = []
+                for photo_id, albums in current_batch:
                     if organization == 'by_date':
-                        current_location = f"Processing date structure - Batch {batch_idx}"
+                        future = executor.submit(
+                            processor._process_single_photo_by_date,
+                            photo_id, working_dir
+                        )
                     else:
-                        current_location = f"Processing albums - Batch {batch_idx}"
+                        future = executor.submit(
+                            processor._process_single_photo,
+                            photo_id, albums, working_dir
+                        )
+                    futures.append((future, photo_id))
 
-                    print(f"\r{current_location} | Completed {total_processed} of {self.unique_total}")
-                    print(f"\rTotal: {total_processed}/{self.unique_total} files | "
-                        f"Success: {len(self.unique_successful)} | "
-                        f"Failed: {len(self.unique_failed)} | "
-                        f"Time elapsed: {elapsed} | "
-                        f"Estimated remaining: {remaining}", end='\r')
-                    sys.stdout.flush()
+                # Process results for this batch
+                for future, photo_id in futures:
+                    result = future.result()
+                    if result and isinstance(result, tuple):
+                        source_file, dest_file = result
+                        if dest_file and dest_file.exists():
+                            self.unique_successful.add(photo_id)
+                        else:
+                            self.unique_failed.add(photo_id)
+                    else:
+                        self.unique_failed.add(photo_id)
 
-                self._cleanup_memory()
+                    total_processed += 1
 
-            print("\n\nProcessing Complete")
-            sys.stdout.flush()
+                # Update progress after processing batch
+                elapsed_time = time.time() - self.start_time
+                photos_per_second = total_processed / elapsed_time if elapsed_time > 0 else 0
+                remaining_photos = self.unique_total - total_processed
+                estimated_remaining = remaining_photos / photos_per_second if photos_per_second > 0 else 0
 
-        except Exception as e:
-            print(f"Error in photo processing: {str(e)}")
-            raise
+                elapsed = time.strftime('%H:%M:%S', time.gmtime(elapsed_time))
+                remaining = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining))
+
+                # Show current batch info and overall progress
+                if organization == 'by_date':
+                    current_location = f"Processing date structure - Batch {batch_idx}"
+                else:
+                    current_location = f"Processing albums - Batch {batch_idx}"
+
+                print(f"\r{current_location} | Completed {total_processed} of {self.unique_total}")
+                print(f"\rTotal: {total_processed}/{self.unique_total} files | "
+                    f"Success: {len(self.unique_successful)} | "
+                    f"Failed: {len(self.unique_failed)} | "
+                    f"Time elapsed: {elapsed} | "
+                    f"Estimated remaining: {remaining}", end='\r')
+                sys.stdout.flush()
+
+            self._cleanup_memory()
+
+        print("\n\nProcessing Complete")
+        sys.stdout.flush()
 
     def _cleanup_memory(self):
         """Perform memory cleanup between batches"""
         gc.collect()
-
-        # Clear caches
-        self.user_info_cache.clear()
 
         # Log memory usage
         #process = psutil.Process()
@@ -1670,351 +785,7 @@ class FlickrToImmich:
         memory_info = psutil.Process().memory_info()
         logging.info(f"Final memory usage: {memory_info.rss / (1024*1024):.1f}MB")
 
-    def _build_formatted_description(self, metadata: Dict) -> str:
-        """Create a formatted description including key metadata fields based on configuration"""
-        if not self.include_extended_description:
-            return metadata.get("description", "")
 
-        metadata_sections = []
-
-        # Add highlight rank if available (always at the top)
-        if 'engagement' in metadata and 'rank' in metadata['engagement'] and 'total_ranked' in metadata['engagement']:
-            metadata_sections.extend([
-                f"Highlight Rank: #{metadata['engagement']['rank']} (of {metadata['engagement']['total_ranked']})",
-                "-----"  # Separator after rank
-            ])
-
-        # Add description if it exists and isn't empty
-        if metadata.get("description"):
-            metadata_sections.extend([
-                "Description:",
-                metadata.get("description")
-            ])
-
-        # Add comments section if there are any comments
-        if metadata.get('comments'):
-            metadata_sections.extend([
-                "",
-                "Flickr Comments:",
-                *[f"- {self._format_user_comment(comment)}"
-                for comment in metadata.get('comments', [])]
-            ])
-
-        # Add favorites section if API is connected and photo has favorites
-        try:
-            fave_count = int(metadata.get('count_faves', '0'))
-        except (ValueError, TypeError):
-            fave_count = 0
-
-        if self.flickr and fave_count > 0:
-            favorites = self._get_photo_favorites(metadata['id'])
-            if favorites:
-                metadata_sections.extend([
-                    "",
-                    "Flickr Faves:",
-                    *[f"- {fave['username'] or fave['nsid']} ({fave['favedate']})"
-                    for fave in favorites]
-                ])
-
-        # Add albums section
-        if photo_id := metadata.get('id'):
-            albums = self.photo_to_albums.get(photo_id, [])
-            if albums:
-                metadata_sections.extend([
-                    "",
-                    "Flickr Albums:",
-                    *[f"- {album_name}" for album_name in albums]
-                ])
-
-        # Add the rest of metadata sections
-        metadata_sections.extend([
-            "",
-            "-----",
-            "Flickr Meta:",
-            f"View Count: {metadata.get('count_views', '0')}",
-            f"Favorite Count: {metadata.get('count_faves', '0')}",
-            f"Comment Count: {metadata.get('count_comments', '0')}",
-            "--",
-            f"Privacy: {metadata.get('privacy', '')}",
-            f"Safety Level: {metadata.get('safety', '')}",
-            "--",
-            f"Flickr URL: {metadata.get('photopage', '')}",
-            f"Creator Profile: {self.account_data.get('screen_name', '')} / {self.account_data.get('profile_url', '')}",
-            "--",
-        ])
-
-        # Filter out empty sections and join with newlines
-        description = "\n".join(section for section in metadata_sections if section is not None and section != "")
-        return description
-
-    def _format_user_comment(self, comment) -> str:
-        """Format a user comment with username and realname if available"""
-        username, realname = self._get_user_info(comment['user'])
-        if realname:
-            user_display = f"{realname} ({username})"
-        else:
-            user_display = username
-        return f"{user_display} ({comment['date']}): {comment['comment']}"
-
-
-    def _handle_failed_file(self, photo_id: str, source_file: Optional[Path], error_reason: str) -> Tuple[Optional[Path], Optional[Path]]:
-        """Handle a failed file by copying it to the failed directory and logging the error"""
-        try:
-            if source_file and source_file.exists():
-                # Create failed_files directory
-                self.failed_dir.mkdir(parents=True, exist_ok=True)
-
-                # Create destination path using same date structure as main export
-                dest_file = self.failed_dir / source_file.name
-
-                # Handle filename conflicts
-                counter = 1
-                while dest_file.exists():
-                    dest_file = self.failed_dir / f"{source_file.stem}_{counter}{source_file.suffix}"
-                    counter += 1
-
-                # Copy the file
-                try:
-                    shutil.copy2(source_file, dest_file)
-
-                    # Create an error info file
-                    error_info_file = dest_file.with_suffix('.error.txt')
-                    with open(error_info_file, 'w', encoding='utf-8') as f:
-                        f.write(f"Photo ID: {photo_id}\n")
-                        f.write(f"Original path: {source_file}\n")
-                        f.write(f"Error: {error_reason}\n")
-                        f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-                    return source_file, dest_file
-
-                except Exception as copy_error:
-                    print(f"Error copying failed file: {str(copy_error)}")
-                    return None, None
-
-        except Exception as e:
-            print(f"Error handling failed file {photo_id}: {str(e)}")
-
-        return None, None
-
-    #by album processing method
-    def _process_single_photo(self, args: Tuple) -> Tuple[Optional[Path], Optional[Path]]:
-        """Process a single photo and copy to all its album locations"""
-        try:
-            photo_id, albums, working_dir = args
-
-            if not working_dir:
-                return self._handle_failed_file(photo_id, None, "No working directory")
-
-            # Use pre-loaded maps
-            source_file = self.photo_id_map.get(photo_id)
-            if not source_file:
-                return self._handle_failed_file(photo_id, None, "Source file not found")
-
-            photo_json = self._load_json_metadata(photo_id)
-            if not photo_json:
-                return self._handle_failed_file(photo_id, source_file, "No metadata found")
-
-            # Process once for all albums
-            processed_files = []
-            for album_name in albums:
-                try:
-                    # Determine album directory
-                    if album_name == '00_NoAlbum':
-                        date_taken = photo_json.get('date_taken')
-                        if not date_taken:
-                            date_taken = datetime.fromtimestamp(source_file.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
-                        date_path = self._get_date_path(date_taken, self.date_format)
-                        album_dir = working_dir / "00_NoAlbum" / date_path
-                    else:
-                        album_dir = working_dir / self._sanitize_folder_name(album_name)
-
-                    album_dir.mkdir(parents=True, exist_ok=True)
-                    dest_file = album_dir / self._get_destination_filename(photo_id, source_file, photo_json)
-
-                    # Copy file
-                    shutil.copy2(source_file, dest_file)
-
-                    # Only embed metadata for the first copy
-                    if not processed_files:
-                        media_type = self.get_media_type(dest_file)
-                        if media_type == MediaType.IMAGE:
-                            self._embed_image_metadata(dest_file, photo_json)
-                            if self.write_xmp_sidecars:
-                                self._write_xmp_sidecar(dest_file, photo_json)
-                        elif media_type == MediaType.VIDEO:
-                            self._embed_video_metadata(dest_file, photo_json)
-                            if self.write_xmp_sidecars:
-                                self._write_xmp_sidecar(dest_file, photo_json)
-
-                    processed_files.append(dest_file)
-
-                except Exception as e:
-                    return self._handle_failed_file(photo_id, source_file, f"Album processing error: {str(e)}")
-
-            return source_file, processed_files[0] if processed_files else None
-
-        except Exception as e:
-            return self._handle_failed_file(photo_id, source_file if 'source_file' in locals() else None,
-                                          f"Processing error: {str(e)}")
-
-    #by date processing method
-    def _process_single_photo_by_date(self, photo_id: str, date_format: str, working_dir: Path) -> Tuple[Optional[Path], Optional[Path]]:
-        """Process a single photo with date-based organization"""
-        try:
-            # Use pre-loaded maps
-            source_file = self.photo_id_map.get(photo_id)
-            if not source_file:
-                return self._handle_failed_file(photo_id, None, "Source file not found")
-
-            photo_json = self._load_json_metadata(photo_id)
-
-            if not photo_json:
-                return self._handle_failed_file(photo_id, source_file, "No metadata found")
-
-            # Get date and create directory
-            try:
-                if photo_json and 'date_taken' in photo_json:
-                    date_taken = photo_json['date_taken']
-                else:
-                    date_taken = datetime.fromtimestamp(source_file.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
-            except Exception:
-                date_taken = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-            date_path = self._get_date_path(date_taken, date_format)
-            date_dir = working_dir / date_path
-            date_dir.mkdir(parents=True, exist_ok=True)
-
-            dest_file = date_dir / self._get_destination_filename(photo_id, source_file, photo_json)
-
-            # Process file
-            shutil.copy2(source_file, dest_file)
-
-            if photo_json:
-                media_type = self.get_media_type(dest_file)
-                if media_type == MediaType.IMAGE:
-                    self._embed_image_metadata(dest_file, photo_json)
-                    if self.write_xmp_sidecars:
-                        self._write_xmp_sidecar(dest_file, photo_json)
-                elif media_type == MediaType.VIDEO:
-                    self._embed_video_metadata(dest_file, photo_json)
-                    if self.write_xmp_sidecars:
-                        self._write_xmp_sidecar(dest_file, photo_json)
-
-            return source_file, dest_file
-
-        except Exception as e:
-            return self._handle_failed_file(photo_id, source_file if 'source_file' in locals() else None,
-                                          f"Processing error: {str(e)}")
-
-    def _sanitize_filename(self, filename: str) -> str:
-        """Convert filename to filesystem-safe version"""
-        try:
-            # Remove or replace invalid characters
-            invalid_chars = '<>:"/\\|?*'
-            for char in invalid_chars:
-                filename = filename.replace(char, '_')
-
-            # Remove leading/trailing spaces and periods
-            filename = filename.strip('. ')
-
-            # Replace multiple spaces/underscores with single underscore
-            filename = re.sub(r'[\s_]+', '_', filename)
-
-            # Ensure filename isn't empty
-            if not filename or filename.startswith('.'):
-                return 'untitled_photo'
-
-            # Limit filename length (max 255 chars is common filesystem limit)
-            if len(filename) > 255:
-                name, ext = os.path.splitext(filename)
-                filename = name[:255 - len(ext)] + ext
-
-            return filename
-
-        except Exception as e:
-            logging.error(f"Error sanitizing filename '{filename}': {str(e)}")
-            return 'untitled_photo'
-
-    def _embed_image_metadata(self, photo_file: Path, metadata: Dict):
-        """Embed metadata into an image file using exiftool"""
-        try:
-            args = self._build_exiftool_args(photo_file, metadata)
-
-            # First verify JPEG integrity if it's a JPEG file
-            if photo_file.suffix.lower() in ['.jpg', '.jpeg']:
-                is_valid, error_msg = JPEGVerifier.is_jpeg_valid(str(photo_file))
-                if not is_valid:
-                    if not JPEGVerifier.attempt_repair(str(photo_file)):
-                        raise ValueError(f"Invalid JPEG file: {error_msg}")
-
-            # Run exiftool
-            result = subprocess.run(args, capture_output=True, text=True)
-
-            if result.returncode != 0:
-                raise ValueError(f"Exiftool error: {result.stderr}")
-
-            if result.stderr and 'error' in result.stderr.lower():
-                logging.warning(f"Exiftool warning for {photo_file}: {result.stderr}")
-
-        except Exception as e:
-            error_msg = f"Error embedding metadata in {photo_file}: {str(e)}"
-            logging.error(error_msg)
-            raise
-
-    def _load_photo_metadata(self, photo_id: str) -> Optional[Dict]:
-       """Load metadata for a specific photo"""
-       metadata = self._load_json_metadata(photo_id)
-       if not metadata:
-           return None
-
-       if self.use_api and self.flickr:
-           try:
-               photo_info = self.flickr.photos.getInfo(
-                   api_key=os.environ['FLICKR_API_KEY'],
-                   photo_id=photo_id
-               )
-               """
-               self._extract_privacy_from_api(photo_info, metadata)
-               self._extract_albums_from_api(photo_id, metadata)
-               self._extract_orientation_from_api(photo_info, metadata)
-               """
-
-           except Exception as e:
-               if not self.quiet:
-                   logging.debug(f"API fetch failed for photo {photo_id}")
-
-       return metadata
-
-    def _load_json_metadata(self, photo_id: str) -> Optional[Dict]:
-        """Load metadata for a photo, handling multiple possible IDs"""
-        try:
-            # First try direct metadata file
-            metadata_file = self._find_metadata_file(photo_id)
-            if metadata_file:
-                with open(metadata_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-
-            # If no direct match, look for files that might contain this as original ID
-            all_metadata_files = list(self.metadata_dir.glob("photo_*.json"))
-            for mfile in all_metadata_files:
-                try:
-                    with open(mfile, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        # Check various fields where the ID might appear
-                        if (str(data.get('id', '')) == photo_id or
-                            str(data.get('original_id', '')) == photo_id or
-                            photo_id in [str(x) for x in data.get('related_ids', [])] or
-                            photo_id in str(data.get('original', ''))):
-                            return data
-                except:
-                    continue
-
-            logging.debug(f"No metadata found for photo {photo_id}")
-            return None
-
-        except Exception as e:
-            logging.error(f"Error loading JSON metadata for photo {photo_id}: {str(e)}")
-            return None
 
     def _find_photo_file(self, photo_id: str, filename: str) -> Optional[Path]:
         """Find the original photo file using the Flickr ID with enhanced logging"""
@@ -2067,169 +838,6 @@ class FlickrToImmich:
         logging.error(f"Could not find media file for {photo_id} ({filename})")
         return None
 
-    def _embed_image_metadata(self, photo_file: Path, metadata: Dict):
-        """Embed metadata into an image file using exiftool"""
-        try:
-            args = self._build_exiftool_args(photo_file, metadata)
-            result = subprocess.run(args, capture_output=True, text=True, check=True)
-
-            if result.stderr:
-                logging.warning(f"Exiftool warnings for {photo_file}: {result.stderr}")
-
-        except subprocess.CalledProcessError as e:
-            error_msg = f"Error embedding metadata in {photo_file}: {e.stderr}"
-            logging.error(error_msg)
-            self.stats['errors'].append(error_msg)
-            raise
-
-    def _embed_video_metadata(self, video_file: Path, metadata: Dict):
-        """Embed metadata into a video file using exiftool"""
-        try:
-            # Build video-specific exiftool arguments
-            args = self._build_exiftool_args(video_file, metadata, is_video=True)
-
-            # Run exiftool
-            result = subprocess.run(args, capture_output=True, text=True)
-
-            if result.returncode != 0:
-                raise ValueError(f"Exiftool error: {result.stderr}")
-
-            if result.stderr and 'error' in result.stderr.lower():
-                logging.warning(f"Exiftool warning for {video_file}: {result.stderr}")
-
-        except Exception as e:
-            error_msg = f"Error embedding metadata in {video_file}: {str(e)}"
-            logging.error(error_msg)
-            raise
-
-
-    def _write_xmp_sidecar(self, media_file: Path, metadata: Dict):
-        """Create XMP sidecar file with extended and Flickr-specific metadata"""
-        sidecar_file = Path(str(media_file) + '.xmp')
-
-        # Get enhanced description using existing method
-        enhanced_description = self._build_formatted_description(metadata)
-
-        # Build tag list from Flickr tags
-        tags = [tag["tag"] for tag in metadata.get('tags', [])]
-
-        # Function to safely encode text for XML
-        def xml_escape(text):
-            if not isinstance(text, str):
-                text = str(text)
-            return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&apos;')
-
-        xmp_content = f"""<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
-        <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 5.1.2">
-        <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-                xmlns:dc="http://purl.org/dc/elements/1.1/"
-                xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
-                xmlns:xmp="http://ns.adobe.com/xap/1.0/"
-                xmlns:lr="http://ns.adobe.com/lightroom/1.0/"
-                xmlns:flickr="http://flickr.com/schema/2024/01/">
-        <rdf:Description rdf:about="">
-            <!-- Enhanced Description -->
-            <dc:description>
-                <rdf:Alt>
-                    <rdf:li xml:lang="x-default">{xml_escape(enhanced_description)}</rdf:li>
-                </rdf:Alt>
-            </dc:description>
-            <!-- Engagement Metrics -->
-                    <flickr:engagement rdf:parseType="Resource">
-                        <flickr:rank>{xml_escape(str(metadata.get('engagement', {}).get('rank', '0')))}</flickr:rank>
-                        <flickr:totalRanked>{xml_escape(str(metadata.get('engagement', {}).get('total_ranked', '0')))}</flickr:totalRanked>
-                        <flickr:favoriteCount>{xml_escape(str(metadata.get('engagement', {}).get('favorites', '0')))}</flickr:favoriteCount>
-                        <flickr:commentCount>{xml_escape(str(metadata.get('engagement', {}).get('comments', '0')))}</flickr:commentCount>
-                    </flickr:engagement>
-            <!-- Tags -->
-            <dc:subject>
-                <rdf:Bag>
-                    {''.join(f'<rdf:li>{xml_escape(tag)}</rdf:li>' for tag in tags)}
-                </rdf:Bag>
-            </dc:subject>
-
-            <!-- Basic Metadata -->
-            <dc:title>
-                <rdf:Alt>
-                    <rdf:li xml:lang="x-default">{xml_escape(metadata.get("name", ""))}</rdf:li>
-                </rdf:Alt>
-            </dc:title>
-            <dc:creator>
-                <rdf:Seq>
-                    <rdf:li>{xml_escape(self.account_data.get("real_name", ""))}</rdf:li>
-                </rdf:Seq>
-            </dc:creator>
-            <dc:rights>
-                <rdf:Alt>
-                    <rdf:li xml:lang="x-default">{xml_escape(metadata.get("license", "All Rights Reserved"))}</rdf:li>
-                </rdf:Alt>
-            </dc:rights>
-            <xmp:CreateDate>{xml_escape(metadata["date_taken"])}</xmp:CreateDate>
-            <xmp:ModifyDate>{xml_escape(metadata["date_taken"])}</xmp:ModifyDate>
-
-            <!-- Photo-specific Flickr metadata -->
-            <flickr:id>{xml_escape(metadata["id"])}</flickr:id>
-            <flickr:photopage>{xml_escape(metadata["photopage"])}</flickr:photopage>
-            <flickr:original>{xml_escape(metadata["original"])}</flickr:original>
-            <flickr:viewCount>{xml_escape(metadata.get("count_views", "0"))}</flickr:viewCount>
-            <flickr:favoriteCount>{xml_escape(metadata.get("count_faves", "0"))}</flickr:favoriteCount>
-            <flickr:commentCount>{xml_escape(metadata.get("count_comments", "0"))}</flickr:commentCount>
-            <flickr:tagCount>{xml_escape(metadata.get("count_tags", "0"))}</flickr:tagCount>
-            <flickr:noteCount>{xml_escape(metadata.get("count_notes", "0"))}</flickr:noteCount>
-
-            <!-- Privacy and Permissions -->
-            <flickr:privacy>{xml_escape(metadata.get("privacy", ""))}</flickr:privacy>
-            <flickr:commentPermissions>{xml_escape(metadata.get("comment_permissions", ""))}</flickr:commentPermissions>
-            <flickr:taggingPermissions>{xml_escape(metadata.get("tagging_permissions", ""))}</flickr:taggingPermissions>
-            <flickr:safety>{xml_escape(metadata.get("safety", ""))}</flickr:safety>
-
-            <!-- Account Information -->
-            <flickr:accountInfo rdf:parseType="Resource">        return self._han
-                <flickr:realName>{xml_escape(self.account_data.get("real_name", ""))}</flickr:realName>
-                <flickr:screenName>{xml_escape(self.account_data.get("screen_name", ""))}</flickr:screenName>
-                <flickr:joinDate>{xml_escape(self.account_data.get("join_date", ""))}</flickr:joinDate>
-                <flickr:profileUrl>{xml_escape(self.account_data.get("profile_url", ""))}</flickr:profileUrl>
-                <flickr:nsid>{xml_escape(self.account_data.get("nsid", ""))}</flickr:nsid>
-                <flickr:proUser>{xml_escape(self.account_data.get("pro_user", "no"))}</flickr:proUser>
-            </flickr:accountInfo>
-
-            <!-- Comments -->
-            <flickr:comments>
-                <rdf:Bag>
-                    {''.join(f'''<rdf:li rdf:parseType="Resource">
-                    <flickr:commentId>{xml_escape(comment["id"])}</flickr:commentId>
-                    <flickr:commentDate>{xml_escape(comment["date"])}</flickr:commentDate>
-                    <flickr:commentUser>{xml_escape(comment["user"])}</flickr:commentUser>
-                    <flickr:commentText>{xml_escape(comment["comment"])}</flickr:commentText>
-                    </rdf:li>''' for comment in metadata.get("comments", []))}
-                </rdf:Bag>
-            </flickr:comments>
-
-            <!-- Favorites -->
-            <flickr:favorites>
-                <rdf:Bag>
-                    {''.join(f'''<rdf:li rdf:parseType="Resource">
-                    <flickr:favoriteUser>{xml_escape(fave["username"] or fave["nsid"])}</flickr:favoriteUser>
-                    <flickr:favoriteDate>{xml_escape(fave["favedate"])}</flickr:favoriteDate>
-                    </rdf:li>''' for fave in (self._get_photo_favorites(metadata['id']) if self.flickr and int(metadata.get('count_faves', '0')) > 0 else []))}
-                </rdf:Bag>
-            </flickr:favorites>
-
-            <!-- Albums -->
-            <flickr:albums>
-                <rdf:Bag>
-                    {''.join(f'''<rdf:li>{xml_escape(album_name)}</rdf:li>'''
-                    for album_name in self.photo_to_albums.get(metadata.get('id', ''), []))}
-                </rdf:Bag>
-            </flickr:albums>
-
-        </rdf:Description>
-        </rdf:RDF>
-        </x:xmpmeta>
-        <?xpacket end="w"?>"""
-
-        with open(sidecar_file, 'w', encoding='utf-8') as f:
-            f.write(xmp_content)
 
     def _build_gps_xmp(self, geo: Dict) -> str:
         """Build GPS XMP tags if geo data is available"""
@@ -2239,123 +847,6 @@ class FlickrToImmich:
         return f"""
         <exif:GPSLatitude>{geo['latitude']}</exif:GPSLatitude>
         <exif:GPSLongitude>{geo['longitude']}</exif:GPSLongitude>"""
-
-    def _build_exiftool_args(self, media_file: Path, metadata: Dict, is_video: bool = False) -> List[str]:
-        """Build exiftool arguments for metadata embedding - standard metadata only"""
-        enhanced_description = self._build_formatted_description(metadata)
-        args = [
-            'exiftool',
-            '-overwrite_original',
-            '-ignoreMinorErrors',
-            '-m',
-
-            # Core timestamp metadata
-            f'-DateTimeOriginal={metadata["date_taken"]}',
-            f'-CreateDate={metadata["date_taken"]}',
-
-            # Basic descriptive metadata
-            f'-Title={metadata.get("name", "")}',
-            f'-ImageDescription={enhanced_description}',
-            f'-IPTC:Caption-Abstract={enhanced_description}',
-            f'-Copyright={metadata.get("license", "All Rights Reserved")}',
-            f'-Artist={self.account_data.get("real_name", "")}',
-            f'-Creator={self.account_data.get("real_name", "")}',
-
-            # Basic tags
-            *[f'-Keywords={tag["tag"]}' for tag in metadata.get('tags', [])],
-        ]
-
-        if media_file.suffix.lower() in ['.jpg', '.jpeg', '.tiff', '.tif', '.JPG', '.JPEG', '.TIFF', '.TIF']:
-            try:
-                with Image.open(media_file) as img:
-                    # Get existing EXIF data
-                    exif = img._getexif()
-                    if exif:
-                        # Find the orientation tag
-                        orientation_tag = None
-                        for tag_id in ExifTags.TAGS:
-                            if ExifTags.TAGS[tag_id] == 'Orientation':
-                                orientation_tag = tag_id
-                                break
-
-                        current_orientation = exif.get(orientation_tag)
-                        width, height = img.size
-                        is_portrait = height > width
-
-                        logging.debug(f"Processing orientation for {media_file}")
-                        logging.debug(f"Current EXIF orientation: {current_orientation}")
-                        logging.debug(f"Image dimensions: {width}x{height} (Portrait: {is_portrait})")
-
-                        # Determine orientation
-                        if current_orientation is None:
-                            new_orientation = 1  # Default if no EXIF orientation
-                        elif 'rotation' in metadata:
-                            rotation_degrees = int(metadata["rotation"])
-                            logging.debug(f"Flickr rotation value: {rotation_degrees}")
-
-                            if rotation_degrees > 0:
-                                rotation_to_orientation = {
-                                    90: 6,    # Rotate 90 CW
-                                    180: 3,   # Rotate 180
-                                    270: 8    # Rotate 270 CW
-                                }
-                                new_orientation = rotation_to_orientation.get(rotation_degrees, 1)
-                            else:
-                                new_orientation = current_orientation
-                        else:
-                            new_orientation = current_orientation
-
-                        # Handle combined rotations
-                        if current_orientation and new_orientation != current_orientation:
-                            # Calculate combined rotation
-                            current_rotation = EXIF_ORIENTATION_MAP.get(current_orientation, {}).get('rotation', 0)
-                            new_rotation = EXIF_ORIENTATION_MAP.get(new_orientation, {}).get('rotation', 0)
-                            total_rotation = (current_rotation + new_rotation) % 360
-
-                            # Map total rotation back to orientation
-                            rotation_to_final = {
-                                0: 1,
-                                90: 6,
-                                180: 3,
-                                270: 8
-                            }
-                            new_orientation = rotation_to_final.get(total_rotation, 1)
-
-                        # Log the orientation change
-                        if current_orientation != new_orientation:
-                            old_desc = EXIF_ORIENTATION_MAP.get(current_orientation, {}).get('description', 'Unknown')
-                            new_desc = EXIF_ORIENTATION_MAP.get(new_orientation, {}).get('description', 'Unknown')
-                            logging.debug(f"Changing orientation from {current_orientation} ({old_desc}) "
-                                        f"to {new_orientation} ({new_desc})")
-
-                        # Add orientation commands to exiftool args
-                        args.extend([
-                            f'-IFD0:Orientation#={new_orientation}',
-                            '-IFD0:YCbCrPositioning=1',
-                            '-IFD0:YCbCrSubSampling=2 2'
-                        ])
-
-                        # If the image is mirrored in its target orientation, add mirroring command
-                        if EXIF_ORIENTATION_MAP.get(new_orientation, {}).get('mirrored', False):
-                            args.extend(['-Flop'])  # Flop is horizontal mirroring
-
-            except Exception as e:
-                logging.warning(f"Error handling image orientation for {media_file}: {str(e)}")
-                logging.debug(f"Exception details:", exc_info=True)
-
-        # Standard GPS data if available
-        if metadata.get('geo'):
-            geo = metadata['geo']
-            if 'latitude' in geo and 'longitude' in geo:
-                args.extend([
-                    f'-GPSLatitude={geo["latitude"]}',
-                    f'-GPSLongitude={geo["longitude"]}',
-                ])
-
-        # Add the media file at the end
-        args.append(str(media_file))
-
-        return args
 
     def print_statistics(self):
         """Print processing statistics"""

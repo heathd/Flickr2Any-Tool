@@ -1,0 +1,18 @@
+{
+	"albums": [
+		{
+			"photo_count": "1",
+			"id": "33023451987942148",
+			"url": "https://www.flickr.com/photos/janedoe/albums/33023451987942148",
+			"title": "Old Family Photos",
+			"description": "",
+			"view_count": "0",
+			"created": "1728226446",
+			"last_updated": "1728242112",
+			"cover_photo": "https://www.flickr.com/photos/janedoe/0",
+			"photos": [
+				"56824916783"
+			]
+		}
+	]
+}
