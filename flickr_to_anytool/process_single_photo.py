@@ -115,7 +115,7 @@ class ProcessSinglePhoto:
                             if self.write_xmp_sidecars:
                                 self.exif_writer._write_xmp_sidecar(dest_file, photo_json)
                         elif media_type == MediaType.VIDEO:
-                            self._embed_video_metadata(dest_file, photo_json)
+                            self.exif_writer._embed_video_metadata(dest_file, photo_json)
                             if self.write_xmp_sidecars:
                                 self.exif_writer._write_xmp_sidecar(dest_file, photo_json)
 
