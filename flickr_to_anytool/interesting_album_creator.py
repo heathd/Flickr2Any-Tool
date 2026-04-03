@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 import sys
 import traceback
-from typing import List, TypedDict
+from typing import List
 
 from flickr_to_anytool.constants import MediaType
 from flickr_to_anytool.exif_writer import ExifWriter
@@ -19,8 +19,9 @@ from flickr_to_anytool.output_helpers import OutputHelpers
 
 
 class InterestingAlbumCreator:
-    def __init__(self, account_data, exif_writer: ExifWriter, photo_id_map: Dict, interestingness_filter: InterestingnessFilter, flickr_export_metadata: FlickrExportMetadata, output_dir: Path, stats: Dict, write_xmp_sidecars: bool):
+    def __init__(self, account_data, resume: bool, exif_writer: ExifWriter, photo_id_map: Dict, interestingness_filter: InterestingnessFilter, flickr_export_metadata: FlickrExportMetadata, output_dir: Path, stats: Dict, write_xmp_sidecars: bool):
         self.account_data = account_data
+        self.resume = resume
         self.exif_writer = exif_writer
         self.photo_id_map = photo_id_map
         self.interestingness_filter = interestingness_filter
@@ -94,17 +95,13 @@ class InterestingAlbumCreator:
 
                     folder_name = f"0{list(privacy_groups.keys()).index(privacy_type) + 1}_{privacy_type.replace(' ', '_').title()}_Highlights"
 
-                    try:
-                        self._create_single_interesting_album(
-                            highlights_dir,
-                            folder_name,
-                            f"Your most engaging {privacy_type} Flickr photos",
-                            photos
-                        )
-                        total_exported += len(photos)
-                    except Exception as e:
-                        print(f"Error creating album {folder_name}: {str(e)}")
-                        continue
+                    self._create_single_interesting_album(
+                        highlights_dir,
+                        folder_name,
+                        f"Your most engaging {privacy_type} Flickr photos",
+                        photos
+                    )
+                    total_exported += len(photos)
 
             print(f"\nHighlight albums creation complete!")
             print(f"Total photos exported: {total_exported}")
@@ -222,10 +219,6 @@ class InterestingAlbumCreator:
 
             return []
 
-        except Exception as e:
-            print(f"Error analyzing photos: {str(e)}")
-            return []
-
         finally:
             # Cleanup
             if 'temp_results_file' in locals() and temp_results_file.exists():
@@ -250,84 +243,75 @@ class InterestingAlbumCreator:
 
             processed = 0
             for i, photo in enumerate(photos, 1):
-                try:
-                    source_file = photo['original_file']
-                    if not isinstance(source_file, Path):
-                        source_file = Path(source_file)
+                source_file = photo['original_file']
+                if not isinstance(source_file, Path):
+                    source_file = Path(source_file)
 
-                    if not source_file.exists():
-                        self.stats['skipped']['count'] += 1
-                        self.stats['skipped']['details'].append(
-                            (str(source_file), "Source file not found")
-                        )
-                        continue
-
-                    # Create filename without Flickr ID
-                    if photo['title']:
-                        safe_title = OutputHelpers.sanitize_folder_name(photo['title'])
-                        photo_filename = f"{safe_title}{source_file.suffix}"
-                    else:
-                        photo_filename = OutputHelpers.get_destination_filename(photo['id'], source_file, photo)
-
-                    dest_file = album_dir / photo_filename
-
-                    # Handle filename conflicts
-                    counter = 1
-                    base_name = dest_file.stem
-                    extension = dest_file.suffix
-                    while dest_file.exists():
-                        dest_file = album_dir / f"{base_name}_{counter}{extension}"
-                        counter += 1
-
-                    if i % 5 == 0 or i == total_photos:
-                        logging.info(f"\r{folder_name}: {i}/{total_photos} ({(i/total_photos)*100:.1f}%)", end='')
-                        sys.stdout.flush()
-
-                    # Copy file
-                    shutil.copy2(source_file, dest_file)
-
-                    # Prepare metadata
-                    photo_metadata = photo.copy()
-                    photo_metadata['original_file'] = str(source_file)
-                    photo_metadata['original'] = str(source_file)
-
-                    # Add engagement metrics to metadata
-                    photo_metadata['engagement'] = {
-                        'rank': i,
-                        'total_ranked': total_photos,
-                        'favorites': photo['fave_count'],
-                        'comments': photo['comment_count'],
-                        'views': photo.get('count_views', 0)
-                    }
-
-                    # Ensure photopage exists
-                    if 'photopage' not in photo_metadata:
-                        photo_metadata['photopage'] = f"https://www.flickr.com/photos/{self.account_data.get('nsid', '')}/{photo['id']}"
-
-                    # Embed metadata based on media type
-                    media_type = OutputHelpers.get_media_type(dest_file)
-                    if media_type == MediaType.IMAGE:
-                        self.exif_writer._embed_image_metadata(dest_file, photo_metadata)
-                    elif media_type == MediaType.VIDEO:
-                        self.exif_writer._embed_video_metadata(dest_file, photo_metadata)
-
-                    if self.write_xmp_sidecars:
-                        self.exif_writer._write_xmp_sidecar(dest_file, photo_metadata)
-
-                    processed += 1
-                    self.stats['successful']['count'] += 1
-                    self.stats['successful']['details'].append(
-                        (str(source_file), str(dest_file), "Highlight photo processed successfully")
+                if not source_file.exists():
+                    self.stats['skipped']['count'] += 1
+                    self.stats['skipped']['details'].append(
+                        (str(source_file), "Source file not found")
                     )
-
-                except Exception as e:
-                    error_msg = f"Error processing highlight photo {photo.get('id', 'unknown')}: {str(e)}"
-                    self.stats['failed']['count'] += 1
-                    self.stats['failed']['details'].append(
-                        (str(source_file) if 'source_file' in locals() else "unknown", error_msg)
-                    )
-                    logging.error(error_msg)
                     continue
+
+                # Create filename without Flickr ID
+                if photo['title']:
+                    safe_title = OutputHelpers.sanitize_folder_name(photo['title'])
+                    photo_filename = f"{safe_title}{source_file.suffix}"
+                else:
+                    photo_filename = OutputHelpers.get_destination_filename(photo['id'], source_file, photo)
+
+                dest_file = album_dir / photo_filename
+
+                # Handle filename conflicts
+                counter = 1
+                base_name = dest_file.stem
+                extension = dest_file.suffix
+                while dest_file.exists():
+                    dest_file = album_dir / f"{base_name}_{counter}{extension}"
+                    counter += 1
+
+                if i % 5 == 0 or i == total_photos:
+                    logging.info(f"\r{folder_name}: {i}/{total_photos} ({(i/total_photos)*100:.1f}%)")
+                    sys.stdout.flush()
+
+                # Copy file
+                shutil.copy2(source_file, dest_file)
+
+                # Prepare metadata
+                photo_metadata = photo.copy()
+                photo_metadata['original_file'] = str(source_file)
+                photo_metadata['original'] = str(source_file)
+
+                # Add engagement metrics to metadata
+                photo_metadata['engagement'] = {
+                    'rank': i,
+                    'total_ranked': total_photos,
+                    'favorites': photo['fave_count'],
+                    'comments': photo['comment_count'],
+                    'views': photo.get('count_views', 0)
+                }
+
+                # Ensure photopage exists
+                if 'photopage' not in photo_metadata:
+                    photo_metadata['photopage'] = f"https://www.flickr.com/photos/{self.account_data.get('nsid', '')}/{photo['id']}"
+
+                # Embed metadata based on media type
+                media_type = OutputHelpers.get_media_type(dest_file)
+                if media_type == MediaType.IMAGE:
+                    self.exif_writer._embed_image_metadata(dest_file, photo_metadata)
+                elif media_type == MediaType.VIDEO:
+                    self.exif_writer._embed_video_metadata(dest_file, photo_metadata)
+
+                if self.write_xmp_sidecars:
+                    self.exif_writer._write_xmp_sidecar(dest_file, photo_metadata)
+
+                processed += 1
+                self.stats['successful']['count'] += 1
+                self.stats['successful']['details'].append(
+                    (str(source_file), str(dest_file), "Highlight photo processed successfully")
+                )
+
 
             print(f"\nCompleted {folder_name}: {processed}/{total_photos} photos processed successfully")
             sys.stdout.flush()

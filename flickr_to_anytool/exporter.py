@@ -15,9 +15,11 @@ from tqdm import tqdm
 import gc
 import psutil
 
+from flickr_to_anytool import interestingness_filter
 from flickr_to_anytool.exif_writer import ExifWriter
 from flickr_to_anytool.flickr_api_metadata import FlickrApiMetadata
 from flickr_to_anytool.flickr_export_metadata import FlickrExportMetadata
+from flickr_to_anytool.interesting_album_creator import InterestingAlbumCreator
 from flickr_to_anytool.flickr_export_multipart_metadata_cache import FlickrExportMultipartMetadataCache
 from flickr_to_anytool.output_helpers import OutputHelpers
 from flickr_to_anytool.process_single_photo import ProcessSinglePhoto
@@ -210,7 +212,7 @@ class FlickrToImmich:
                 'total_files': 0,
                 'successful': {
                     'count': 0,
-                    'details': set()  # Will store (source_file, dest_file, status) tuples
+                    'details': []  # Will store (source_file, dest_file, status) tuples
                 },
                 'failed': {
                     'count': 0,
@@ -638,6 +640,20 @@ class FlickrToImmich:
             print(error_msg)
             logging.error(error_msg)
             raise
+
+    def create_interesting_albums(self, time_period: str, photo_count: int = 100):
+        filter_criteria = interestingness_filter.InterestingnessFilter(
+            fave_weight=self.fave_weight,
+            comment_weight=self.comment_weight,
+            view_weight=self.view_weight,
+            min_views=self.min_views,
+            min_faves=self.min_faves,
+            min_comments=self.min_comments
+        )
+        exif_writer = ExifWriter(self.flickr_wrapper, self.photo_to_albums, self.account_data, self.include_extended_description, self.write_xmp_sidecars)
+
+        i = InterestingAlbumCreator(self.account_data, self.resume, exif_writer, self.photo_id_map, filter_criteria, self.flickr_export_metadata, self.output_dir, self.stats, self.write_xmp_sidecars)
+        i.create_interesting_albums(time_period, photo_count)
 
     def process_photos(self, organization: str, date_format: str = None):
         """Process photos with enhanced debugging"""
