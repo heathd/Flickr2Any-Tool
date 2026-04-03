@@ -499,8 +499,9 @@ class FlickrToImmich:
         import re
         # Updated pattern to catch more ID variations
         patterns = [
-            r'_(\d{8,11})(?:_o)?(?:\.|_)',  # Standard pattern
-            r'[^0-9](\d{8,11})[^0-9]',      # Any 8-11 digit number
+            r'^(\d{8,11})_',                 # ID at start of filename: {id}_{secret}_o.jpg
+            r'_(\d{8,11})(?:_o)?(?:\.|_)',   # Standard pattern: photo_{id}_o.jpg
+            r'(?:^|[^0-9])(\d{8,11})[^0-9]', # Any 8-11 digit number with non-digit boundary
         ]
 
         all_matches = set()

@@ -118,6 +118,11 @@ class TestExtractPhotoId(unittest.TestCase):
         # Should extract the 11-digit ID, not the 4, 2, or 2-digit numbers
         self.assertEqual(result, '12345678901')
 
+    def test_id_at_start_of_filename_with_hex_secret(self):
+        """Test extraction from Flickr format where ID is at the start: {id}_{hex_secret}_o.jpg"""
+        result = self.instance._extract_photo_id('52759384619_be0461e77c_o.jpg')
+        self.assertEqual(result, '52759384619')
+
 
 if __name__ == '__main__':
     unittest.main()
