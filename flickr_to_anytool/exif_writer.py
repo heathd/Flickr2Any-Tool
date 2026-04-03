@@ -23,8 +23,6 @@ class ExifWriter:
     def _embed_image_metadata(self, photo_file: Path, metadata: Dict):
         """Embed metadata into an image file using exiftool"""
         try:
-            args = self._build_exiftool_args(photo_file, metadata)
-
             # First verify JPEG integrity if it's a JPEG file
             if photo_file.suffix.lower() in ['.jpg', '.jpeg']:
                 is_valid, error_msg = JPEGVerifier.is_jpeg_valid(str(photo_file))
@@ -32,11 +30,19 @@ class ExifWriter:
                     if not JPEGVerifier.attempt_repair(str(photo_file)):
                         raise ValueError(f"Invalid JPEG file: {error_msg}")
 
+            args = self._build_exiftool_args(photo_file, metadata)
+
             # Run exiftool
             result = subprocess.run(args, capture_output=True, text=True)
 
             if result.returncode != 0:
-                raise ValueError(f"Exiftool error: {result.stderr}")
+                # If exiftool fails, try again with strip_orientation=True to remove broken orientation
+                logging.debug(f"First exiftool attempt failed, retrying with orientation stripping")
+                args = self._build_exiftool_args(photo_file, metadata, strip_orientation=True)
+                result = subprocess.run(args, capture_output=True, text=True)
+
+                if result.returncode != 0:
+                    raise ValueError(f"Exiftool error: {result.stderr}")
 
             if result.stderr and 'error' in result.stderr.lower():
                 logging.warning(f"Exiftool warning for {photo_file}: {result.stderr}")
@@ -46,121 +52,120 @@ class ExifWriter:
             logging.error(error_msg)
             raise
 
-    def _build_exiftool_args(self, media_file: Path, metadata: Dict, is_video: bool = False) -> List[str]:
-        """Build exiftool arguments for metadata embedding - standard metadata only"""
+    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.tiff', '.tif', '.JPG', '.JPEG', '.TIFF', '.TIF'}
+
+    def _build_base_args(self, metadata: Dict) -> List[str]:
+        """Core exiftool flags and metadata fields common to all files."""
         enhanced_description = self._build_formatted_description(metadata)
-        args = [
+        return [
             'exiftool',
             '-overwrite_original',
             '-ignoreMinorErrors',
             '-m',
-
-            # Core timestamp metadata
             f'-DateTimeOriginal={metadata["date_taken"]}',
             f'-CreateDate={metadata["date_taken"]}',
-
-            # Basic descriptive metadata
             f'-Title={metadata.get("name", "")}',
             f'-ImageDescription={enhanced_description}',
             f'-IPTC:Caption-Abstract={enhanced_description}',
             f'-Copyright={metadata.get("license", "All Rights Reserved")}',
             f'-Artist={self.account_data.get("real_name", "")}',
             f'-Creator={self.account_data.get("real_name", "")}',
-
-            # Basic tags
             *[f'-Keywords={tag["tag"]}' for tag in metadata.get('tags', [])],
         ]
 
-        if media_file.suffix.lower() in ['.jpg', '.jpeg', '.tiff', '.tif', '.JPG', '.JPEG', '.TIFF', '.TIF']:
-            try:
-                with Image.open(media_file) as img:
-                    # Get existing EXIF data
-                    exif = img._getexif()
-                    if exif:
-                        # Find the orientation tag
-                        orientation_tag = None
-                        for tag_id in ExifTags.TAGS:
-                            if ExifTags.TAGS[tag_id] == 'Orientation':
-                                orientation_tag = tag_id
-                                break
+    def _compute_orientation(self, media_file: Path, metadata: Dict) -> int:
+        """
+        Read current EXIF orientation and apply Flickr rotation metadata.
+        Returns a valid EXIF orientation value (1-8).
+        Raises if the image cannot be opened.
+        """
+        rotation_to_orientation = {90: 6, 180: 3, 270: 8}
+        rotation_to_final = {0: 1, 90: 6, 180: 3, 270: 8}
 
-                        current_orientation = exif.get(orientation_tag)
-                        width, height = img.size
-                        is_portrait = height > width
+        with Image.open(media_file) as img:
+            exif = img._getexif()
+            if not exif:
+                return 1
 
-                        logging.debug(f"Processing orientation for {media_file}")
-                        logging.debug(f"Current EXIF orientation: {current_orientation}")
-                        logging.debug(f"Image dimensions: {width}x{height} (Portrait: {is_portrait})")
+            orientation_tag = next(
+                (tag_id for tag_id in ExifTags.TAGS if ExifTags.TAGS[tag_id] == 'Orientation'),
+                None
+            )
+            current_orientation = exif.get(orientation_tag)
 
-                        # Determine orientation
-                        if current_orientation is None:
-                            new_orientation = 1  # Default if no EXIF orientation
-                        elif 'rotation' in metadata:
-                            rotation_degrees = int(metadata["rotation"])
-                            logging.debug(f"Flickr rotation value: {rotation_degrees}")
+            logging.debug(f"Processing orientation for {media_file}: current={current_orientation}, "
+                          f"dimensions={img.size}")
 
-                            if rotation_degrees > 0:
-                                rotation_to_orientation = {
-                                    90: 6,    # Rotate 90 CW
-                                    180: 3,   # Rotate 180
-                                    270: 8    # Rotate 270 CW
-                                }
-                                new_orientation = rotation_to_orientation.get(rotation_degrees, 1)
-                            else:
-                                new_orientation = current_orientation
-                        else:
-                            new_orientation = current_orientation
+            if current_orientation is None:
+                return 1
 
-                        # Handle combined rotations
-                        if current_orientation and new_orientation != current_orientation:
-                            # Calculate combined rotation
-                            current_rotation = EXIF_ORIENTATION_MAP.get(current_orientation, {}).get('rotation', 0)
-                            new_rotation = EXIF_ORIENTATION_MAP.get(new_orientation, {}).get('rotation', 0)
-                            total_rotation = (current_rotation + new_rotation) % 360
+            if 'rotation' in metadata:
+                rotation_degrees = int(metadata["rotation"])
+                logging.debug(f"Flickr rotation value: {rotation_degrees}")
+                new_orientation = rotation_to_orientation.get(rotation_degrees, current_orientation) \
+                    if rotation_degrees > 0 else current_orientation
+            else:
+                new_orientation = current_orientation
 
-                            # Map total rotation back to orientation
-                            rotation_to_final = {
-                                0: 1,
-                                90: 6,
-                                180: 3,
-                                270: 8
-                            }
-                            new_orientation = rotation_to_final.get(total_rotation, 1)
+            if current_orientation and new_orientation != current_orientation:
+                current_rotation = EXIF_ORIENTATION_MAP.get(current_orientation, {}).get('rotation', 0)
+                new_rotation = EXIF_ORIENTATION_MAP.get(new_orientation, {}).get('rotation', 0)
+                new_orientation = rotation_to_final.get((current_rotation + new_rotation) % 360, 1)
 
-                        # Log the orientation change
-                        if current_orientation != new_orientation:
-                            old_desc = EXIF_ORIENTATION_MAP.get(current_orientation, {}).get('description', 'Unknown')
-                            new_desc = EXIF_ORIENTATION_MAP.get(new_orientation, {}).get('description', 'Unknown')
-                            logging.debug(f"Changing orientation from {current_orientation} ({old_desc}) "
-                                        f"to {new_orientation} ({new_desc})")
+            if current_orientation != new_orientation:
+                old_desc = EXIF_ORIENTATION_MAP.get(current_orientation, {}).get('description', 'Unknown')
+                new_desc = EXIF_ORIENTATION_MAP.get(new_orientation, {}).get('description', 'Unknown')
+                logging.debug(f"Changing orientation: {current_orientation} ({old_desc}) -> "
+                              f"{new_orientation} ({new_desc})")
 
-                        # Add orientation commands to exiftool args
-                        args.extend([
-                            f'-IFD0:Orientation#={new_orientation}',
-                            '-IFD0:YCbCrPositioning=1',
-                            '-IFD0:YCbCrSubSampling=2 2'
-                        ])
+            return new_orientation
 
-                        # If the image is mirrored in its target orientation, add mirroring command
-                        if EXIF_ORIENTATION_MAP.get(new_orientation, {}).get('mirrored', False):
-                            args.extend(['-Flop'])  # Flop is horizontal mirroring
+    def _build_orientation_args(self, media_file: Path, metadata: Dict, strip_orientation: bool) -> List[str]:
+        """
+        Returns orientation-related exiftool args for image files.
+        Uses strip_orientation=True to clear corrupt EXIF and set a safe default.
+        """
+        if strip_orientation:
+            logging.debug(f"Stripping corrupt EXIF from {media_file}, using defaults")
+            return [
+                '-IFD0:*=',
+                '-IFD0:Orientation#=1',
+            ]
 
-            except Exception as e:
-                logging.warning(f"Error handling image orientation for {media_file}: {str(e)}")
-                logging.debug(f"Exception details:", exc_info=True)
+        try:
+            new_orientation = self._compute_orientation(media_file, metadata)
+            args = [
+                f'-IFD0:Orientation#={new_orientation}',
+                '-IFD0:YCbCrPositioning=1',
+                '-IFD0:YCbCrSubSampling=2 2',
+            ]
+            if EXIF_ORIENTATION_MAP.get(new_orientation, {}).get('mirrored', False):
+                args.append('-Flop')
+            return args
+        except Exception as e:
+            logging.warning(f"Error handling image orientation for {media_file}: {str(e)}")
+            logging.debug("Exception details:", exc_info=True)
+            return []
 
-        # Standard GPS data if available
-        if metadata.get('geo'):
-            geo = metadata['geo']
-            if 'latitude' in geo and 'longitude' in geo:
-                args.extend([
-                    f'-GPSLatitude={geo["latitude"]}',
-                    f'-GPSLongitude={geo["longitude"]}',
-                ])
+    def _build_gps_args(self, metadata: Dict) -> List[str]:
+        """Returns GPS exiftool args if geo data is present."""
+        geo = metadata.get('geo', {})
+        if 'latitude' in geo and 'longitude' in geo:
+            return [
+                f'-GPSLatitude={geo["latitude"]}',
+                f'-GPSLongitude={geo["longitude"]}',
+            ]
+        return []
 
-        # Add the media file at the end
+    def _build_exiftool_args(self, media_file: Path, metadata: Dict, is_video: bool = False, strip_orientation: bool = False) -> List[str]:
+        """Build exiftool arguments for metadata embedding."""
+        args = self._build_base_args(metadata)
+
+        if media_file.suffix.lower() in self.IMAGE_EXTENSIONS:
+            args += self._build_orientation_args(media_file, metadata, strip_orientation)
+
+        args += self._build_gps_args(metadata)
         args.append(str(media_file))
-
         return args
 
 
@@ -244,7 +249,10 @@ class ExifWriter:
 
     def _format_user_comment(self, comment) -> str:
         """Format a user comment with username and realname if available"""
-        username, realname = self.flickr_wrapper._get_user_info(comment['user'])
+        if self.flickr_wrapper:
+            username, realname = self.flickr_wrapper._get_user_info(comment['user'])
+        else:
+            username, realname = comment['user'], ""
         if realname:
             user_display = f"{realname} ({username})"
         else:
