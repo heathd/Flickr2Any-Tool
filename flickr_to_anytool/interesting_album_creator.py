@@ -254,22 +254,14 @@ class InterestingAlbumCreator:
                     )
                     continue
 
-                # Create filename without Flickr ID
+                # Create filename always including photo ID to ensure uniqueness
                 if photo['title']:
                     safe_title = OutputHelpers.sanitize_folder_name(photo['title'])
-                    photo_filename = f"{safe_title}{source_file.suffix}"
+                    photo_filename = f"{safe_title}_{photo['id']}{source_file.suffix}"
                 else:
-                    photo_filename = OutputHelpers.get_destination_filename(photo['id'], source_file, photo)
+                    photo_filename = f"{photo['id']}{source_file.suffix}"
 
                 dest_file = album_dir / photo_filename
-
-                # Handle filename conflicts
-                counter = 1
-                base_name = dest_file.stem
-                extension = dest_file.suffix
-                while dest_file.exists():
-                    dest_file = album_dir / f"{base_name}_{counter}{extension}"
-                    counter += 1
 
                 if i % 5 == 0 or i == total_photos:
                     logging.info(f"\r{folder_name}: {i}/{total_photos} ({(i/total_photos)*100:.1f}%)")
